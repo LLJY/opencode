@@ -666,9 +666,12 @@ export function fromError(
       return new APIError(
         {
           message: e.message,
-          isRetryable: true,
+          isRetryable: e.info.autoReplaySafe,
           metadata: {
             code: e.name,
+            transport: e.info.transport,
+            phase: e.info.phase,
+            autoReplaySafe: String(e.info.autoReplaySafe),
           },
         },
         { cause: e },
