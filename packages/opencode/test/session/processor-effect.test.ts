@@ -71,6 +71,10 @@ const cfg = {
 }
 
 function providerCfg(url: string) {
+  return providerCfgWithOptions(url)
+}
+
+function providerCfgWithOptions(url: string, options?: Record<string, unknown>) {
   return {
     ...cfg,
     provider: {
@@ -80,6 +84,7 @@ function providerCfg(url: string) {
         options: {
           ...cfg.provider.test.options,
           baseURL: url,
+          ...options,
         },
       },
     },
@@ -655,6 +660,98 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(states).toStrictEqual([1])
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests rollback assistant-only partial output before retry", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(reply().text("partial").hang().item(), reply().text("after").stop().item())
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry partial output")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry partial output" }],
+          tools: {},
+        })
+
+        const parts = MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+        expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+          "after",
+        ])
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: (url) => providerCfgWithOptions(url, { chunkTimeout: 50 }) },
+  ),
+)
+
+it.live("session.processor effect tests do not retry partial output after tool activity", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.push(reply().text("partial").pendingTool("lookup", { query: "weather" }).hang().item())
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry tool partial output")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry tool partial output" }],
+          tools: {},
+        })
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(1)
+        expect(handle.message.error).toBeDefined()
+      }),
+    { config: (url) => providerCfgWithOptions(url, { chunkTimeout: 50 }) },
   ),
 )
 
