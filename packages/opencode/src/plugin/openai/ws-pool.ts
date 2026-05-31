@@ -113,9 +113,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         onConnectionInvalid: (error) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
-          if (!entry.fallback) recordStreamFailure(entry)
+          entry.fallback = true
           invalidate(entry)
-          resolveFirstEvent(false)
+          if (error.info.autoReplaySafe) resolveFirstEvent(false)
         },
         onAbort: (error) => {
           entry.busy = false
@@ -149,13 +149,22 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         throw error
       }
 
-      recordStreamFailure(entry)
+      const streamError = toWebSocketSetupError(error)
+      if (streamError) entry.fallback = true
+      if (!streamError) recordStreamFailure(entry)
       invalidate(entry)
       if (entry.fallback) return httpFetch(input, httpInit)
       return failedResponse(
-        new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
-          cause: error,
-        }),
+        streamError ??
+          new ProviderError.ResponseStreamError(
+            error instanceof Error ? error.message : String(error),
+            {
+              transport: "websocket",
+              phase: "before_first_event",
+              autoReplaySafe: false,
+            },
+            { cause: error },
+          ),
       )
     }
   }
@@ -235,6 +244,8 @@ async function socket(
     headers,
     timeout: connectTimeout,
     signal: signal ?? undefined,
+  }).catch((error) => {
+    throw toWebSocketSetupError(error) ?? error
   })
   entry.connectedAt = Date.now()
   return next
@@ -247,6 +258,20 @@ function invalidate(entry: PoolEntry) {
     entry.socket = undefined
   }
   entry.connectedAt = undefined
+}
+
+function toWebSocketSetupError(error: unknown) {
+  if (error instanceof ProviderError.ResponseStreamError) return error
+  if (OpenAIWebSocket.isAbortError(error)) return
+  return new ProviderError.ResponseStreamError(
+    error instanceof Error ? error.message : String(error),
+    {
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+    },
+    { cause: error },
+  )
 }
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(init: T | undefined): T | undefined {

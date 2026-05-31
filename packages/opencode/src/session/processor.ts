@@ -18,6 +18,7 @@ import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
+import { ProviderError } from "@/provider/error"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
@@ -100,6 +101,10 @@ interface ProcessorContext extends Input {
   snapshot: string | undefined
   blocked: boolean
   needsCompaction: boolean
+  attemptHasToolActivity: boolean
+  attemptCommitted: boolean
+  attemptHasAssistantOutput: boolean
+  attemptPartIDs: PartID[]
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
@@ -139,6 +144,10 @@ const layer = Layer.effect(
         snapshot: initialSnapshot,
         blocked: false,
         needsCompaction: false,
+        attemptHasToolActivity: false,
+        attemptCommitted: false,
+        attemptHasAssistantOutput: false,
+        attemptPartIDs: [],
         currentText: undefined,
         reasoningMap: {},
       }
@@ -149,6 +158,20 @@ const layer = Layer.effect(
           providerID: input.model.providerID,
           aborted,
         })
+
+      function rememberAttemptPart(partID: PartID) {
+        if (ctx.attemptPartIDs.includes(partID)) return
+        ctx.attemptPartIDs.push(partID)
+      }
+
+      function resetAttemptState() {
+        ctx.attemptHasToolActivity = false
+        ctx.attemptCommitted = false
+        ctx.attemptHasAssistantOutput = false
+        ctx.attemptPartIDs = []
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+      }
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -320,12 +343,14 @@ const layer = Layer.effect(
             }
             installChunkedText(ctx.reasoningMap[value.id])
             yield* session.updatePart(ctx.reasoningMap[value.id])
+            rememberAttemptPart(ctx.reasoningMap[value.id].id)
             return
 
           case "reasoning-delta":
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
             appendChunkedText(ctx.reasoningMap[value.id], value.text)
+            ctx.attemptHasAssistantOutput = true
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
@@ -340,6 +365,9 @@ const layer = Layer.effect(
             if (value.providerMetadata && value.id in ctx.reasoningMap) {
               ctx.reasoningMap[value.id].metadata = value.providerMetadata
             }
+            if (value.id in ctx.reasoningMap && ctx.reasoningMap[value.id].text.length > 0) {
+              ctx.attemptHasAssistantOutput = true
+            }
             yield* finishReasoning(value.id)
             return
 
@@ -347,6 +375,7 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            ctx.attemptHasToolActivity = true
             yield* ensureToolCall(value)
             return
 
@@ -355,6 +384,7 @@ const layer = Layer.effect(
             return
 
           case "tool-input-end": {
+            ctx.attemptHasToolActivity = true
             yield* ensureToolCall(value)
             return
           }
@@ -363,6 +393,7 @@ const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            ctx.attemptHasToolActivity = true
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
@@ -412,6 +443,7 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
+            ctx.attemptHasToolActivity = true
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
@@ -445,6 +477,7 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            ctx.attemptHasToolActivity = true
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -454,16 +487,19 @@ const layer = Layer.effect(
 
           case "step-start":
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
+            const stepStartID = PartID.ascending()
             yield* session.updatePart({
-              id: PartID.ascending(),
+              id: stepStartID,
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
               snapshot: ctx.snapshot,
               type: "step-start",
             })
+            rememberAttemptPart(stepStartID)
             return
 
           case "step-finish": {
+            ctx.attemptCommitted = true
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -526,11 +562,13 @@ const layer = Layer.effect(
             }
             installChunkedText(ctx.currentText)
             yield* session.updatePart(ctx.currentText)
+            rememberAttemptPart(ctx.currentText.id)
             return
 
           case "text-delta":
             if (!ctx.currentText) return
             appendChunkedText(ctx.currentText, value.text)
+            ctx.attemptHasAssistantOutput = true
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.currentText.sessionID,
@@ -554,6 +592,7 @@ const layer = Layer.effect(
               },
               { text: ctx.currentText.text },
             )).text
+            if (ctx.currentText.text.length > 0) ctx.attemptHasAssistantOutput = true
             {
               const end = Date.now()
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
@@ -656,6 +695,42 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const rollbackRetryableStreamError = (error: unknown) =>
+        Effect.gen(function* () {
+          if (!(error instanceof ProviderError.ResponseStreamError)) return error
+          if (error.info.autoReplaySafe) return error
+          if (ctx.attemptHasToolActivity) return error
+          if (ctx.attemptCommitted) return error
+          if (!ctx.attemptHasAssistantOutput) return error
+          if (ctx.attemptPartIDs.length === 0) return error
+
+          yield* Effect.forEach(
+            [...ctx.attemptPartIDs].reverse(),
+            (partID) =>
+              session.removePart({
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                partID,
+              }),
+            { discard: true },
+          )
+          resetAttemptState()
+          return new ProviderError.ResponseStreamError(
+            error.message,
+            { ...error.info, autoReplaySafe: true },
+            { cause: error },
+          )
+        }).pipe(
+          Effect.catchIf(
+            () => true,
+            (rollbackError) => {
+              return Effect.logWarning("rollback retryable stream error failed", { error: errorMessage(rollbackError) }).pipe(
+                Effect.as(error),
+              )
+            },
+          ),
+        )
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
@@ -666,8 +741,7 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
-            ctx.currentText = undefined
-            ctx.reasoningMap = {}
+            resetAttemptState()
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
@@ -688,6 +762,11 @@ const layer = Layer.effect(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
+            ),
+            Effect.catchIf(() => true, (error) =>
+              Effect.gen(function* () {
+                return yield* Effect.fail(yield* rollbackRetryableStreamError(error))
+              }),
             ),
             Effect.retry(
               SessionRetry.policy({
