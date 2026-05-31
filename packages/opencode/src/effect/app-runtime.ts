@@ -3,6 +3,7 @@ import { attach } from "./run-service"
 import * as Observability from "@opencode-ai/core/effect/observability"
 
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { AuthWellKnown } from "@opencode-ai/core/auth-well-known"
 import { Database } from "@opencode-ai/core/database/database"
 import { Auth } from "@/auth"
 import { Account } from "@/account/account"
@@ -60,6 +61,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 export const AppLayer = Layer.mergeAll(
   Npm.defaultLayer,
   AppFileSystem.defaultLayer,
+  AuthWellKnown.defaultLayer,
   Database.defaultLayer,
   Auth.defaultLayer,
   Account.defaultLayer,
