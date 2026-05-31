@@ -1276,6 +1276,21 @@ export function options(input: {
     result["gateway"] = { caching: "auto" }
   }
 
+  if (input.model.providerID === "nvidia" && input.model.api.npm === "@ai-sdk/openai-compatible") {
+    if (modelId.includes("deepseek-v4")) {
+      result["chat_template_kwargs"] = {
+        enable_thinking: true,
+        thinking: true,
+      }
+    }
+    if (modelId.includes("glm-5")) {
+      result["chat_template_kwargs"] = {
+        enable_thinking: true,
+        clear_thinking: false,
+      }
+    }
+  }
+
   // Any gpt version above 5.4 in combination with azure does not support reasoningEffort
   // so we should return early here.
   const [, gptMajorVersion, gptMinorVersion] = input.model.api.id.match(/gpt-(\d+)\.(\d+)/) ?? []

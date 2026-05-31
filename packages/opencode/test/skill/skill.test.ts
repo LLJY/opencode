@@ -270,6 +270,87 @@ description: A skill in the .claude/skills directory.
     ),
   )
 
+  it.live("does not follow symlinked external skill directories", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await Bun.write(
+              path.join(dir, "real-skills", "linked", "SKILL.md"),
+              `---
+name: linked-skill
+description: A symlinked skill that should not load.
+---
+
+# Linked Skill
+`,
+            )
+            await fs.mkdir(path.join(dir, ".claude", "skills"), { recursive: true })
+            await fs.symlink(path.join(dir, "real-skills", "linked"), path.join(dir, ".claude", "skills", "linked"))
+          })
+
+          const skill = yield* Skill.Service
+          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("does not follow symlinked external skill files", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(dir, "real-skills", "linked-file"), { recursive: true })
+            await Bun.write(
+              path.join(dir, "real-skills", "linked-file", "SKILL.md"),
+              `---
+name: linked-file-skill
+description: A symlinked skill file that should not load.
+---
+
+# Linked File Skill
+`,
+            )
+            await fs.mkdir(path.join(dir, ".claude", "skills", "linked-file"), { recursive: true })
+            await fs.symlink(
+              path.join(dir, "real-skills", "linked-file", "SKILL.md"),
+              path.join(dir, ".claude", "skills", "linked-file", "SKILL.md"),
+            )
+          })
+
+          const skill = yield* Skill.Service
+          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("does not follow symlinked external skill roots", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await Bun.write(
+              path.join(dir, "real-claude", "skills", "root-skill", "SKILL.md"),
+              `---
+name: root-skill
+description: A skill behind a symlinked .claude root that should not load.
+---
+
+# Root Skill
+`,
+            )
+            await fs.symlink(path.join(dir, "real-claude"), path.join(dir, ".claude"))
+          })
+
+          const skill = yield* Skill.Service
+          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("discovers global skills from ~/.claude/skills/ directory", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.acquireRelease(

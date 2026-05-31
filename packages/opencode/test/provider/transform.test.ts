@@ -453,6 +453,79 @@ describe("ProviderTransform.options - google thinkingConfig gating", () => {
   })
 })
 
+describe("ProviderTransform.options - nvidia thinking kwargs", () => {
+  const sessionID = "test-session-123"
+
+  const createModel = (apiId: string) =>
+    ({
+      id: `nvidia/${apiId}`,
+      providerID: "nvidia",
+      api: {
+        id: apiId,
+        url: "https://integrate.api.nvidia.com/v1",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      name: apiId,
+      capabilities: {
+        temperature: true,
+        reasoning: true,
+        attachment: true,
+        toolcall: true,
+        input: { text: true, audio: false, image: true, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: {
+        input: 0.001,
+        output: 0.002,
+        cache: { read: 0.0001, write: 0.0002 },
+      },
+      limit: {
+        context: 128000,
+        output: 8192,
+      },
+      status: "active",
+      options: {},
+      headers: {},
+    }) as any
+
+  test("sets chat_template_kwargs for Nvidia DeepSeek V4 models", () => {
+    const result = ProviderTransform.options({
+      model: createModel("deepseek-ai/deepseek-v4-flash"),
+      sessionID,
+      providerOptions: {},
+    })
+
+    expect(result.chat_template_kwargs).toEqual({
+      enable_thinking: true,
+      thinking: true,
+    })
+  })
+
+  test("sets chat_template_kwargs for Nvidia GLM-5 models", () => {
+    const result = ProviderTransform.options({
+      model: createModel("z-ai/glm-5.1"),
+      sessionID,
+      providerOptions: {},
+    })
+
+    expect(result.chat_template_kwargs).toEqual({
+      enable_thinking: true,
+      clear_thinking: false,
+    })
+  })
+
+  test("does not set chat_template_kwargs for unrelated Nvidia models", () => {
+    const result = ProviderTransform.options({
+      model: createModel("meta/llama-3.1-70b-instruct"),
+      sessionID,
+      providerOptions: {},
+    })
+
+    expect(result.chat_template_kwargs).toBeUndefined()
+  })
+})
+
 describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
   const sessionID = "test-session-123"
 
