@@ -98,6 +98,30 @@ function googleVertexAnthropicBaseURL(project: string | undefined, location: str
   return `https://aiplatform.${location}.rep.googleapis.com/v1/projects/${project}/locations/${location}/publishers/anthropic/models`
 }
 
+function isNvidiaNim(model: Model, baseURL: unknown) {
+  if (model.api.npm !== "@ai-sdk/openai-compatible") return false
+  if (model.providerID === "nvidia") return true
+  return typeof baseURL === "string" && baseURL.includes("nvidia.com")
+}
+
+function normalizeNvidiaModelID(id: string) {
+  return id.replace(/^(nvidia\/){2,}/, "nvidia/")
+}
+
+function normalizeNvidiaRequestBody(body: string) {
+  const parsed = iife(() => {
+    try {
+      return JSON.parse(body)
+    } catch {
+      return undefined
+    }
+  })
+  if (!isRecord(parsed) || typeof parsed.model !== "string") return body
+  const model = normalizeNvidiaModelID(parsed.model)
+  if (model === parsed.model) return body
+  return JSON.stringify({ ...parsed, model })
+}
+
 type BundledSDK = {
   languageModel(modelId: string): LanguageModelV3
   chat?: (modelId: string) => LanguageModelV3
@@ -1545,15 +1569,29 @@ const layer = Layer.effect(
           if (!plugin.auth) continue
           const providerID = ProviderV2.ID.make(plugin.auth.provider)
           if (disabled.has(providerID)) continue
-
-          const stored = yield* auth.get(providerID).pipe(Effect.orDie)
-          if (!stored) continue
           if (!plugin.auth.loader) continue
+
+          const data = database[plugin.auth.provider]
+          if (!data) continue
+          const stored = yield* auth.get(providerID).pipe(Effect.orDie)
+          const configuredKey = iife(() => {
+            const key = providers[providerID]?.key ?? data.options.apiKey
+            return typeof key === "string" && key !== "" ? key : undefined
+          })
+          const syntheticAuth = !stored && configuredKey ? { type: "api" as const, key: configuredKey } : undefined
+          const pluginAuth = stored ?? syntheticAuth
+          if (!pluginAuth) continue
 
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
-              () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
+              () =>
+                bridge.promise(
+                  auth.get(providerID).pipe(
+                    Effect.orDie,
+                    Effect.map((current) => current ?? syntheticAuth),
+                  ),
+                ) as any,
+              toPublicInfo(data),
             ),
           )
           const opts = options ?? {}
@@ -1751,6 +1789,28 @@ const layer = Layer.effect(
 
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
+
+          // Strip openai itemId metadata following what codex does
+          if (
+            (model.api.npm === "@ai-sdk/openai" || model.api.npm === "@ai-sdk/azure") &&
+            opts.body &&
+            opts.method === "POST"
+          ) {
+            const body = JSON.parse(opts.body as string)
+            const keepIds = body.store === true
+            if (!keepIds && Array.isArray(body.input)) {
+              for (const item of body.input) {
+                if ("id" in item) {
+                  delete item.id
+                }
+              }
+              opts.body = JSON.stringify(body)
+            }
+          }
+
+          if (isNvidiaNim(model, options["baseURL"]) && typeof opts.body === "string" && opts.method === "POST") {
+            opts.body = normalizeNvidiaRequestBody(opts.body)
+          }
 
           const res = await fetchFn(input, {
             ...opts,
