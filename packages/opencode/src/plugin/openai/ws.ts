@@ -170,17 +170,38 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     controller?.error(error)
   }
 
+  function failure(message: string, cause?: unknown) {
+    return new ProviderError.ResponseStreamError(
+      message,
+      {
+        transport: "websocket",
+        phase: emitted ? "after_first_event" : "before_first_event",
+        autoReplaySafe: !emitted,
+      },
+      cause === undefined ? undefined : { cause },
+    )
+  }
+
+  function failTerminal(event: Record<string, unknown>, error: Error) {
+    if (completed) return
+    completed = true
+    cleanup()
+    options.onTerminal?.(event)
+    if (error instanceof ProviderError.ResponseStreamError) options.onConnectionInvalid?.(error)
+    controller?.error(error)
+  }
+
   function resetIdleTimeout(message: string) {
     if (completed) return
     if (!options.idleTimeout) return
     if (idleTimer) clearTimeout(idleTimer)
-    idleTimer = setTimeout(() => invalidate(new ProviderError.ResponseStreamError(message)), options.idleTimeout)
+    idleTimer = setTimeout(() => invalidate(failure(message)), options.idleTimeout)
   }
 
   async function onMessage(data: WebSocket.RawData, isBinary: boolean) {
     if (completed) return
     if (isBinary) {
-      invalidate(new ProviderError.ResponseStreamError("Unexpected binary WebSocket frame"))
+      invalidate(failure("Unexpected binary WebSocket frame"))
       return
     }
 
@@ -209,11 +230,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
           return
         }
       } catch (error) {
-        invalidate(
-          new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
-            cause: error,
-          }),
-        )
+        invalidate(failure(error instanceof Error ? error.message : String(error), error))
         return
       }
     }
@@ -237,6 +254,12 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
+    const transportTerminalError = event && terminalTransportError(event, failure)
+    if (transportTerminalError) {
+      failTerminal(event, transportTerminalError)
+      return
+    }
+
     if (!emitted) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
@@ -251,7 +274,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
 
     if (!event) return
 
-    if (event.type === "response.completed" || event.type === "response.done") {
+    if (event.type === "response.completed") {
       completed = true
       options.onComplete?.(event)
       options.onTerminal?.(event)
@@ -259,22 +282,50 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
-      completed = true
-      options.onTerminal?.(event)
-      closeCompleted()
+    if (event.type === "response.done") {
+      const status = responseStatus(event)
+      if (status === "completed") {
+        completed = true
+        options.onComplete?.(event)
+        options.onTerminal?.(event)
+        closeCompleted()
+        return
+      }
+      if (status === "incomplete") {
+        failTerminal(event, failure("OpenAI response incomplete", event))
+        return
+      }
+      failTerminal(event, new Error(`OpenAI response ended with status ${status ?? "unknown"}`, { cause: event }))
+      return
+    }
+
+    if (event.type === "response.failed") {
+      failTerminal(event, new Error("OpenAI response failed", { cause: event }))
+      return
+    }
+
+    if (event.type === "response.incomplete") {
+      failTerminal(event, failure("OpenAI response incomplete", event))
+      return
+    }
+
+    if (event.type === "error") {
+      failTerminal(
+        event,
+        transportErrorEvent(event)
+          ? failure(eventErrorMessage(event), event)
+          : new Error(eventErrorMessage(event), { cause: event }),
+      )
     }
   }
 
   function onError(error: Error) {
-    invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
+    invalidate(failure(error.message, error))
   }
 
   function onClose(code: number, reason: Buffer) {
     if (completed) return
-    invalidate(
-      new ProviderError.ResponseStreamError(closeMessage("WebSocket closed before response.completed", code, reason)),
-    )
+    invalidate(failure(closeMessage("WebSocket closed before response.completed", code, reason)))
   }
 
   function onAbort() {
@@ -311,7 +362,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     socket.send(JSON.stringify({ type: "response.create", ...payload }), (error) => {
       if (completed) return
       resetIdleTimeout("idle timeout waiting for websocket")
-      if (error) invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
+      if (error) invalidate(failure(error.message, error))
     })
   }
 
@@ -376,6 +427,51 @@ function closeMessage(message: string, code: number, reason: Buffer) {
   if (code === 1009) details.push("message too big")
   if (reason.length > 0) details.push(reason.toString())
   return `${message} (${details.join(": ")})`
+}
+
+function responseStatus(event: Record<string, unknown>) {
+  if (!("response" in event)) return
+  const response = event.response
+  if (!isRecord(response)) return
+  return typeof response.status === "string" ? response.status : undefined
+}
+
+function terminalTransportError(
+  event: Record<string, unknown>,
+  failure: (message: string, cause?: unknown) => ProviderError.ResponseStreamError,
+) {
+  if (event.type === "response.incomplete") return failure("OpenAI response incomplete", event)
+  if (event.type === "response.done" && responseStatus(event) === "incomplete") {
+    return failure("OpenAI response incomplete", event)
+  }
+  if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
+}
+
+function eventErrorMessage(event: Record<string, unknown>) {
+  if (!("error" in event)) return "OpenAI websocket stream error"
+  const error = event.error
+  if (!isRecord(error)) return "OpenAI websocket stream error"
+  if (typeof error.message === "string" && error.message) return error.message
+  if (typeof error.code === "string" && error.code) return error.code
+  return "OpenAI websocket stream error"
+}
+
+function transportErrorEvent(event: Record<string, unknown>) {
+  const message = eventErrorMessage(event)
+  const code = eventErrorCode(event)
+  if (code === "stream_incomplete" || code === "websocket_connection_limit_reached") return true
+  return /before response\.completed/i.test(message) || /stream[_ ]incomplete/i.test(message)
+}
+
+function eventErrorCode(event: Record<string, unknown>) {
+  if (!("error" in event)) return
+  const error = event.error
+  if (!isRecord(error)) return
+  return typeof error.code === "string" ? error.code : undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
 }
 
 export * as OpenAIWebSocket from "./ws"
