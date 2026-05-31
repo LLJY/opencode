@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
+import { lstat } from "fs/promises"
 import { Effect, Layer, Context, Schema } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import type { Agent } from "@/agent/agent"
@@ -143,7 +144,7 @@ const scan = Effect.fnUntraced(function* (
   state: ScanState,
   root: string,
   pattern: string,
-  opts?: { dot?: boolean; scope?: string },
+  opts?: { dot?: boolean; scope?: string; symlink?: boolean },
 ) {
   const matches = yield* Effect.tryPromise({
     try: () =>
@@ -151,7 +152,7 @@ const scan = Effect.fnUntraced(function* (
         cwd: root,
         absolute: true,
         include: "file",
-        symlink: true,
+        symlink: opts?.symlink ?? true,
         dot: opts?.dot,
       }),
     catch: (error) => error,
@@ -164,10 +165,26 @@ const scan = Effect.fnUntraced(function* (
     }),
   )
 
-  for (const match of matches) {
+  const filtered = opts?.symlink === false ? yield* Effect.filter(matches, (match) => isNotInSymlink(root, match)) : matches
+
+  for (const match of filtered) {
     state.matches.add(match)
     state.dirs.add(path.dirname(match))
   }
+})
+
+const isNotInSymlink = Effect.fnUntraced(function* (root: string, match: string) {
+  const parts = path.relative(root, match).split(path.sep)
+  const symlink = yield* Effect.forEach(
+    [root, ...parts.map((_, index) => path.join(root, ...parts.slice(0, index + 1)))],
+    (candidate) =>
+      Effect.promise(() => lstat(candidate)).pipe(
+        Effect.map((stat) => stat.isSymbolicLink()),
+        Effect.catch(() => Effect.succeed(false)),
+      ),
+    { concurrency: "unbounded" },
+  )
+  return !symlink.some(Boolean)
 })
 
 const discoverSkills = Effect.fnUntraced(function* (
@@ -190,7 +207,7 @@ const discoverSkills = Effect.fnUntraced(function* (
     for (const dir of externalDirs) {
       const root = path.join(global.home, dir)
       if (!(yield* fsys.isDir(root))) continue
-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global" })
+      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global", symlink: false })
     }
 
     const upDirs = yield* fsys
@@ -198,7 +215,7 @@ const discoverSkills = Effect.fnUntraced(function* (
       .pipe(Effect.catch(() => Effect.succeed([] as string[])))
 
     for (const root of upDirs) {
-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project" })
+      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project", symlink: false })
     }
   }
 
