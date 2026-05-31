@@ -27,6 +27,36 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+const textChunks = new WeakMap<{ text: string }, string[]>()
+
+function installChunkedText(part: { text: string }) {
+  textChunks.set(part, [part.text])
+  Object.defineProperty(part, "text", {
+    get() {
+      const chunks = textChunks.get(part)
+      if (!chunks) return ""
+      if (chunks.length === 1) return chunks[0]
+      const text = chunks.join("")
+      textChunks.set(part, [text])
+      return text
+    },
+    set(value: string) {
+      textChunks.set(part, [value])
+    },
+    enumerable: true,
+    configurable: true,
+  })
+}
+
+function appendChunkedText(part: { text: string }, text: string) {
+  const chunks = textChunks.get(part)
+  if (!chunks) {
+    part.text += text
+    return
+  }
+  chunks.push(text)
+}
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -288,13 +318,14 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            installChunkedText(ctx.reasoningMap[value.id])
             yield* session.updatePart(ctx.reasoningMap[value.id])
             return
 
           case "reasoning-delta":
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
-            ctx.reasoningMap[value.id].text += value.text
+            appendChunkedText(ctx.reasoningMap[value.id], value.text)
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
@@ -493,12 +524,13 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            installChunkedText(ctx.currentText)
             yield* session.updatePart(ctx.currentText)
             return
 
           case "text-delta":
             if (!ctx.currentText) return
-            ctx.currentText.text += value.text
+            appendChunkedText(ctx.currentText, value.text)
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.currentText.sessionID,
