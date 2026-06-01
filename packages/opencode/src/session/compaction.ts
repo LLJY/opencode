@@ -504,10 +504,11 @@ const layer = Layer.effect(
       }
 
       if (processor.message.error) return "stop"
-      if (result === "continue") {
+      const outcome = result === "resume" ? "continue" : result
+      if (outcome === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
-      return result
+      return outcome
     })
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
