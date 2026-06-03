@@ -123,6 +123,211 @@ describe("plugin.openai.ws", () => {
     })
   })
 
+  test("treats response.failed as a retryable stream failure before the first event", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "server_error",
+                message: "The model failed to generate a response.",
+              },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (server_error): The model failed to generate a response.",
+    )
+    expect(terminal.map((event) => event.type)).toEqual(["response.failed"])
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+      terminalEvent: "response.failed",
+    })
+  })
+
+  test("keeps lifecycle-only response.failed safe for replay", async () => {
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.created",
+            response: { id: "resp_123", created_at: 1, model: "test" },
+          }),
+        )
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "server_error",
+                message: "The model failed to generate a response.",
+              },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain("OpenAI response failed")
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+      terminalEvent: "response.failed",
+    })
+  })
+
+  test("uses response.error details when top-level response.failed error is generic", async () => {
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            error: { type: "server_error" },
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "upstream_error",
+                message: "Upstream provider error",
+              },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (upstream_error): Upstream provider error",
+    )
+  })
+
+  test("combines split response.failed error details", async () => {
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            error: { code: "upstream_error" },
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: { message: "Upstream provider error" },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (upstream_error): Upstream provider error",
+    )
+  })
+
+  test("marks response.failed after emitted content unsafe to replay", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            error: {
+              code: "upstream_error",
+              message: "Upstream provider error",
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (upstream_error): Upstream provider error",
+    )
+    expect(terminal.map((event) => event.type)).toEqual(["response.failed"])
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "after_first_event",
+      autoReplaySafe: false,
+      terminalEvent: "response.failed",
+    })
+  })
+
+  test("marks response.failed after reasoning output unsafe to replay", async () => {
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.reasoning_text.delta", delta: "thinking" }))
+        socket.send(JSON.stringify({ type: "response.failed" }))
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain("OpenAI response failed")
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "after_first_event",
+      autoReplaySafe: false,
+      terminalEvent: "response.failed",
+    })
+  })
+
   test("treats transport error frames as connection-invalid failures", async () => {
     const terminal: Record<string, unknown>[] = []
     const invalid: ProviderError.ResponseStreamError[] = []
@@ -367,12 +572,64 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("invalidates but does not reuse a socket after terminal failure frames", async () => {
+  test("falls back to HTTP after response.failed before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
       socket.once("message", () => {
-        socket.send(JSON.stringify({ type: connections === 1 ? "response.failed" : "response.completed" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "server_error",
+                message: "The model failed to generate a response.",
+              },
+            },
+          }),
+        )
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    const second = await fetch(server.url, streamRequest())
+
+    expect(await first.text()).toBe("http")
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(2)
+    fetch.close()
+  })
+
+  test("activates HTTP fallback after lifecycle-only response.failed", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.created",
+            response: { id: "resp_123", created_at: 1, model: "test" },
+          }),
+        )
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "server_error",
+                message: "The model failed to generate a response.",
+              },
+            },
+          }),
+        )
       })
     })
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -383,9 +640,46 @@ describe("plugin.openai.ws-pool", () => {
     expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
 
     const second = await fetch(server.url, streamRequest())
-    expect(await second.text()).toContain('data: {"type":"response.completed"}')
-    expect(connections).toBe(2)
-    expect(server.httpRequests).toHaveLength(0)
+
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(1)
+    fetch.close()
+  })
+
+  test("does not fall back to HTTP for the current response after output response.failed", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: {
+                code: "server_error",
+                message: "The model failed to generate a response.",
+              },
+            },
+          }),
+        )
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
+
+    const second = await fetch(server.url, streamRequest())
+
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(1)
     fetch.close()
   })
 
