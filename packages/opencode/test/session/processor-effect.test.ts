@@ -933,6 +933,87 @@ isolatedIt.live("session.processor effect tests resume from rebuilt history afte
   ),
 )
 
+isolatedIt.live("session.processor effect tests do not resume unsafe response.failed after model output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+            LLMEvent.toolResult({
+              id: "call_1",
+              name: "lookup",
+              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+            }),
+            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepStart({ index: 1 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new ProviderError.ResponseStreamError("OpenAI response failed (server_error): failed", {
+                  transport: "websocket",
+                  phase: "after_first_event",
+                  autoReplaySafe: false,
+                  terminalEvent: "response.failed",
+                }),
+              ),
+            ),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not retry response.failed after output")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not retry response.failed after output" }],
+            tools: {},
+          })
+
+          const parts = MessageV2.parts(msg.id)
+          const text = parts.find((part): part is MessageV2.TextPart => part.type === "text")
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(text?.text).toBe("partial")
+          expect(MessageV2.APIError.isInstance(handle.message.error)).toBe(true)
+          if (MessageV2.APIError.isInstance(handle.message.error)) {
+            expect(handle.message.error.data.metadata?.terminalEvent).toBe("response.failed")
+            expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("false")
+          }
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
 isolatedIt.live("session.processor effect tests resume immediately after a completed tool result", () =>
   provideTmpdirInstance(
     (dir) =>

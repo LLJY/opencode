@@ -675,6 +675,7 @@ export function fromError(
             transport: e.info.transport,
             phase: e.info.phase,
             autoReplaySafe: String(e.info.autoReplaySafe),
+            ...(e.info.terminalEvent ? { terminalEvent: e.info.terminalEvent } : {}),
           },
         },
         { cause: e },
