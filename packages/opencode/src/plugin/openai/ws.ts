@@ -144,6 +144,8 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
   let cleanupSocket = () => {}
   let completed = false
   let emitted = false
+  let emittedModelOutput = false
+  let released = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
 
   function cleanup() {
@@ -171,13 +173,20 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     controller?.error(error)
   }
 
-  function failure(message: string, cause?: unknown) {
+  function release() {
+    if (released) return
+    released = true
+    options.onFirstEvent?.()
+  }
+
+  function failure(message: string, cause?: unknown, info?: Partial<ProviderError.ResponseStreamInfo>) {
     return new ProviderError.ResponseStreamError(
       message,
       {
         transport: "websocket",
-        phase: emitted ? "after_first_event" : "before_first_event",
-        autoReplaySafe: !emitted,
+        phase: emittedModelOutput ? "after_first_event" : "before_first_event",
+        autoReplaySafe: !emittedModelOutput,
+        ...info,
       },
       cause === undefined ? undefined : { cause },
     )
@@ -261,7 +270,6 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    if (!emitted) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
         `${text
@@ -270,7 +278,9 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
           .join("\n")}\n\n`,
       ),
     )
+    release()
     emitted = true
+    if (event && modelOutputEvent(event)) emittedModelOutput = true
     resetIdleTimeout("idle timeout waiting for websocket")
 
     if (!event) return
@@ -279,6 +289,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       completed = true
       options.onComplete?.(event)
       options.onTerminal?.(event)
+      release()
       closeCompleted()
       return
     }
@@ -289,6 +300,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
         completed = true
         options.onComplete?.(event)
         options.onTerminal?.(event)
+        release()
         closeCompleted()
         return
       }
@@ -296,12 +308,8 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
         failTerminal(event, failure("OpenAI response incomplete", event))
         return
       }
+      release()
       failTerminal(event, new Error(`OpenAI response ended with status ${status ?? "unknown"}`, { cause: event }))
-      return
-    }
-
-    if (event.type === "response.failed") {
-      failTerminal(event, new Error("OpenAI response failed", { cause: event }))
       return
     }
 
@@ -311,6 +319,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     }
 
     if (event.type === "error") {
+      if (!transportErrorEvent(event)) release()
       failTerminal(
         event,
         transportErrorEvent(event)
@@ -439,13 +448,58 @@ function responseStatus(event: Record<string, unknown>) {
 
 function terminalTransportError(
   event: Record<string, unknown>,
-  failure: (message: string, cause?: unknown) => ProviderError.ResponseStreamError,
+  failure: (
+    message: string,
+    cause?: unknown,
+    info?: Partial<ProviderError.ResponseStreamInfo>,
+  ) => ProviderError.ResponseStreamError,
 ) {
+  if (event.type === "response.failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
   if (event.type === "response.incomplete") return failure("OpenAI response incomplete", event)
   if (event.type === "response.done" && responseStatus(event) === "incomplete") {
     return failure("OpenAI response incomplete", event)
   }
   if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
+}
+
+function responseFailedMessage(event: Record<string, unknown>) {
+  const detail = responseFailedDetail(event)
+  const message = detail?.message
+  const code = detail?.code
+  if (message && code) return `OpenAI response failed (${code}): ${message}`
+  if (message) return `OpenAI response failed: ${message}`
+  if (code) return `OpenAI response failed (${code})`
+  return "OpenAI response failed"
+}
+
+function responseFailedDetail(event: Record<string, unknown>) {
+  const details = [event.error, isRecord(event.response) ? event.response.error : undefined]
+    .filter(isRecord)
+    .map((error) => ({
+      code: typeof error.code === "string" && error.code ? error.code : undefined,
+      message: typeof error.message === "string" && error.message ? error.message : undefined,
+    }))
+    .filter((error) => error.code || error.message)
+    .sort((a, b) => (b.message ? 2 : 0) + (b.code ? 1 : 0) - ((a.message ? 2 : 0) + (a.code ? 1 : 0)))
+  const best = details[0]
+  if (!best) return
+  return {
+    code: best.code ?? details.find((detail) => detail.code)?.code,
+    message: best.message ?? details.find((detail) => detail.message)?.message,
+  }
+}
+
+function modelOutputEvent(event: Record<string, unknown>) {
+  if (typeof event.type !== "string") return false
+  if (event.type === "response.output_text.delta") return true
+  if (event.type === "response.reasoning_text.delta") return true
+  if (event.type === "response.reasoning_summary.delta") return true
+  if (event.type === "response.reasoning_summary_text.delta") return true
+  if (event.type.endsWith(".delta") && event.type.includes("call")) return true
+  if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
+    return isRecord(event.item) && event.item.type !== "message"
+  }
+  return false
 }
 
 function eventErrorMessage(event: Record<string, unknown>) {
