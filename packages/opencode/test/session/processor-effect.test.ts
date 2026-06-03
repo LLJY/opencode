@@ -4,6 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { APICallError, tool } from "ai"
+import { InvalidProviderOutputReason, LLMError, LLMEvent } from "@opencode-ai/llm"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
@@ -28,7 +29,6 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { LLMEvent } from "@opencode-ai/llm"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -779,6 +779,239 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(states).toStrictEqual([1])
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests retry native stream_incomplete LLMError with visible status", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.fail(
+            new LLMError({
+              module: "Route",
+              method: "frames",
+              reason: new InvalidProviderOutputReason({
+                message: "Failed to read openai/openai-responses stream",
+                route: "openai/openai-responses",
+                raw: '{"code":"stream_incomplete","message":"Upstream websocket closed before response.completed"}',
+              }),
+            }),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "after" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const bus = yield* Bus.Service
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "native stream incomplete")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const states: number[] = []
+          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
+            if (evt.properties.sessionID !== chat.id) return
+            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "native stream incomplete" }],
+            tools: {},
+          })
+
+          off()
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(states).toStrictEqual([1])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests rollback retryable stream_incomplete provider-error events", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+            LLMEvent.providerError({
+              message: "stream_incomplete: Upstream websocket closed before response.completed",
+              retryable: true,
+            }),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const bus = yield* Bus.Service
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "provider stream incomplete")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const states: number[] = []
+          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
+            if (evt.properties.sessionID !== chat.id) return
+            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "provider stream incomplete" }],
+            tools: {},
+          })
+
+          off()
+
+          const parts = MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(states).toStrictEqual([1])
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+            "after",
+          ])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests do not replay arbitrary retryable provider-error events", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.providerError({
+              message: "temporary provider failure",
+              retryable: true,
+            }),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_after" }),
+            LLMEvent.textDelta({ id: "text_after", text: "after" }),
+            LLMEvent.textEnd({ id: "text_after" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const bus = yield* Bus.Service
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "generic retryable provider error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const states: number[] = []
+          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
+            if (evt.properties.sessionID !== chat.id) return
+            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "generic retryable provider error" }],
+            tools: {},
+          })
+
+          off()
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(states).toStrictEqual([])
+          expect(handle.message.error).toBeDefined()
+          expect(handle.message.error && "message" in handle.message.error.data ? handle.message.error.data.message : "").toContain(
+            "temporary provider failure",
+          )
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
   ),
 )
 

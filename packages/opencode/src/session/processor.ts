@@ -25,7 +25,7 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
 const textChunks = new WeakMap<{ text: string }, string[]>()
@@ -240,6 +240,41 @@ const layer = Layer.effect(
         if (!ctx.attemptNeedsReset) return
         resetReplayGuardState()
         ctx.attemptNeedsReset = false
+      }
+
+      function currentResponseStreamInfo(
+        message: string,
+        transport?: ProviderError.ResponseStreamInfo["transport"],
+      ): ProviderError.ResponseStreamInfo {
+        const beforeFirstEvent =
+          ctx.attemptPartIDs.length === 0 &&
+          !ctx.attemptHasToolActivity &&
+          !ctx.attemptCommitted &&
+          !ctx.requestHasCommittedToolBoundary
+        return {
+          transport: transport ?? (/websocket/i.test(message) ? "websocket" : "sse"),
+          phase: beforeFirstEvent ? "before_first_event" : "after_first_event",
+          autoReplaySafe: beforeFirstEvent,
+        }
+      }
+
+      function normalizeNativeResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
+        if (error instanceof ProviderError.ResponseStreamError) return error
+        const message = nativeOpenAIResponseStreamMessage(error)
+        if (!message) return undefined
+        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)), {
+          cause: error,
+        })
+      }
+
+      function normalizeRetryableProviderStreamError(
+        message: string,
+        error: Error,
+      ): ProviderError.ResponseStreamError | undefined {
+        if (!responseStreamErrorMessage(message)) return undefined
+        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), {
+          cause: error,
+        })
       }
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
@@ -551,8 +586,10 @@ const layer = Layer.effect(
             return
           }
 
-          case "provider-error":
-            throw new Error(value.message)
+          case "provider-error": {
+            const error = new Error(value.message)
+            throw value.retryable === true ? (normalizeRetryableProviderStreamError(value.message, error) ?? error) : error
+          }
 
           case "step-start":
             resetAttemptIfNeeded()
@@ -794,39 +831,40 @@ const layer = Layer.effect(
         resetAttemptState()
       })
 
-      const recoverRetryableError = (error: unknown) =>
+      const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
         Effect.gen(function* () {
+          const candidate = normalizeNativeResponseStreamError(error) ?? error
           const retryable =
-            error instanceof ProviderError.ResponseStreamError
-              ? { message: error.message }
-              : SessionRetry.retryable(parse(error), input.model.providerID)
-          if (!retryable) return error
+            candidate instanceof ProviderError.ResponseStreamError
+              ? { message: candidate.message }
+              : SessionRetry.retryable(parse(candidate), input.model.providerID)
+          if (!retryable) return candidate
 
-          if (error instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(error)) return error
+          if (candidate instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(candidate)) return candidate
 
           if (ctx.blocked) {
-            return new StopAfterBlockedToolBoundary(retryable.message, { cause: error })
+            return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
           }
 
           if (ctx.attemptHasToolActivity) {
-            return new StopAfterUnsafeToolActivity(retryable.message, { cause: error })
+            return new StopAfterUnsafeToolActivity(retryable.message, { cause: candidate })
           }
 
           if (ctx.requestHasCommittedToolBoundary) {
             yield* rollbackCurrentAttempt()
-            return new ResumeFromPromptLoop(retryable.message, { cause: error })
+            return new ResumeFromPromptLoop(retryable.message, { cause: candidate })
           }
 
-          if (!(error instanceof ProviderError.ResponseStreamError)) return error
-          if (error.info.autoReplaySafe) return error
-          if (ctx.attemptCommitted) return error
-          if (ctx.attemptPartIDs.length === 0) return error
+          if (!(candidate instanceof ProviderError.ResponseStreamError)) return candidate
+          if (candidate.info.autoReplaySafe) return candidate
+          if (ctx.attemptCommitted) return candidate
+          if (ctx.attemptPartIDs.length === 0) return candidate
 
           yield* rollbackCurrentAttempt()
           return new ProviderError.ResponseStreamError(
-            error.message,
-            { ...error.info, autoReplaySafe: true },
-            { cause: error },
+            candidate.message,
+            { ...candidate.info, autoReplaySafe: true },
+            { cause: candidate },
           )
         }).pipe(
           Effect.catchCause((cause) =>
@@ -939,6 +977,27 @@ const layer = Layer.effect(
 
 function unsafeTerminalFailure(error: ProviderError.ResponseStreamError) {
   return error.info.terminalEvent === "response.failed" && !error.info.autoReplaySafe
+}
+
+const RESPONSE_STREAM_ERROR_PATTERNS = [/stream[_ ]incomplete/i, /before\s+response\.completed/i]
+const OPENAI_RESPONSE_STREAM_ROUTES = new Set(["openai/openai-responses", "openai/openai-responses-websocket"])
+
+function nativeOpenAIResponseStreamMessage(input: unknown) {
+  if (!(input instanceof LLMError)) return undefined
+  if (input.reason._tag !== "InvalidProviderOutput") return undefined
+  if (!input.reason.route || !OPENAI_RESPONSE_STREAM_ROUTES.has(input.reason.route)) return undefined
+  return [input.reason.raw, input.reason.message, input.message].find(responseStreamErrorMessage)
+}
+
+function nativeOpenAIResponseTransport(input: unknown): ProviderError.ResponseStreamInfo["transport"] | undefined {
+  if (!(input instanceof LLMError)) return undefined
+  if (input.reason._tag !== "InvalidProviderOutput") return undefined
+  if (input.reason.route === "openai/openai-responses-websocket") return "websocket"
+  return undefined
+}
+
+function responseStreamErrorMessage(value: string | undefined) {
+  return value !== undefined && RESPONSE_STREAM_ERROR_PATTERNS.some((pattern) => pattern.test(value))
 }
 
 export const node = LayerNode.make({
