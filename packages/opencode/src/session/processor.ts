@@ -802,6 +802,8 @@ const layer = Layer.effect(
               : SessionRetry.retryable(parse(error), input.model.providerID)
           if (!retryable) return error
 
+          if (error instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(error)) return error
+
           if (ctx.blocked) {
             return new StopAfterBlockedToolBoundary(retryable.message, { cause: error })
           }
@@ -934,6 +936,10 @@ const layer = Layer.effect(
     return Service.of({ create })
   }),
 )
+
+function unsafeTerminalFailure(error: ProviderError.ResponseStreamError) {
+  return error.info.terminalEvent === "response.failed" && !error.info.autoReplaySafe
+}
 
 export const node = LayerNode.make({
   service: Service,
