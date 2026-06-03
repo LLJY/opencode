@@ -1343,6 +1343,56 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("marks stream_incomplete error events retryable", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "error",
+              code: "stream_incomplete",
+              message: "Upstream websocket closed before response.completed",
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "stream_incomplete: Upstream websocket closed before response.completed",
+          retryable: true,
+        },
+      ])
+    }),
+  )
+
+  it.effect("marks websocket-shaped stream_incomplete error objects retryable", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "error",
+              error: {
+                code: "stream_incomplete",
+                message: "Upstream websocket closed before response.completed",
+              },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "stream_incomplete: Upstream websocket closed before response.completed",
+          retryable: true,
+        },
+      ])
+    }),
+  )
+
   it.effect("falls back to error code when no message is present", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
