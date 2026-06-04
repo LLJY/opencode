@@ -175,6 +175,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    wasCancelled?: Effect.Effect<boolean>
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -328,6 +329,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      wasCancelled?: Effect.Effect<boolean>
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -417,6 +419,7 @@ const layer = Layer.effect(
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
+        wasCancelled: input.wasCancelled,
       })
       const result = yield* processor.process({
         user: userMessage,
