@@ -1084,6 +1084,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const wasCancelled = yield* state.cancelProbe(sessionID)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1153,6 +1154,7 @@ const layer = Layer.effect(
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              wasCancelled,
             })
             if (result === "stop") break
             continue
@@ -1215,6 +1217,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              wasCancelled,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
