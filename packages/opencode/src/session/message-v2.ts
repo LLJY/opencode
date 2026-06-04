@@ -243,15 +243,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 
     if (msg.info.role === "assistant") {
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
+      const aborted = msg.info.error && AbortedError.isInstance(msg.info.error)
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
-      if (
-        msg.info.error &&
-        !(
-          AbortedError.isInstance(msg.info.error) &&
-          msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
-        )
-      ) {
+      if (msg.info.error && !aborted) {
+        continue
+      }
+      if (aborted && !msg.parts.some(replayableAbortedToolPart)) {
         continue
       }
       const assistantMessage: UIMessage = {
@@ -276,6 +274,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       })
       for (const part of msg.parts) {
         if (part.type === "text") {
+          if (aborted) continue
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({
             type: "text",
@@ -283,7 +282,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             ...(differentModel ? {} : { providerMetadata: part.metadata }),
           })
         }
-        if (part.type === "step-start")
+        if (part.type === "step-start" && !aborted)
           assistantMessage.parts.push({
             type: "step-start",
           })
@@ -323,6 +322,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
           }
           if (part.state.status === "error") {
+            if (aborted && part.state.metadata?.interrupted === true) continue
             const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
             if (typeof output === "string") {
               assistantMessage.parts.push({
@@ -348,7 +348,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           }
           // Handle pending/running tool calls to prevent dangling tool_use blocks
           // Anthropic/Claude APIs require every tool_use to have a corresponding tool_result
-          if (part.state.status === "pending" || part.state.status === "running")
+          if (!aborted && (part.state.status === "pending" || part.state.status === "running"))
             assistantMessage.parts.push({
               type: ("tool-" + part.tool) as `tool-${string}`,
               state: "output-error",
@@ -360,6 +360,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
         }
         if (part.type === "reasoning") {
+          if (aborted) continue
           if (differentModel) {
             if (part.text.trim().length > 0)
               assistantMessage.parts.push({
@@ -420,6 +421,13 @@ export function toModelMessages(
   options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options))
+}
+
+function replayableAbortedToolPart(part: Part) {
+  return (
+    part.type === "tool" &&
+    (part.state.status === "completed" || (part.state.status === "error" && part.state.metadata?.interrupted !== true))
+  )
 }
 
 export const page = Effect.fn("MessageV2.page")(function* (input: {
@@ -600,10 +608,49 @@ export function latest(msgs: WithParts[]) {
   return { user, assistant, finished, tasks }
 }
 
+function headerTimeoutError(error: unknown) {
+  if (error instanceof ProviderError.HeaderTimeoutError) {
+    return {
+      message: error.message,
+      code: error.name,
+      timeoutMs: error.ms,
+    }
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    const match = error.message.match(/^Provider response headers timed out after (\d+)ms$/)
+    if (match) {
+      return {
+        message: error.message,
+        code: error.name,
+        timeoutMs: Number(match[1]),
+      }
+    }
+  }
+  return undefined
+}
+
 export function fromError(
   e: unknown,
-  ctx: { providerID: ProviderV2.ID; aborted?: boolean },
+  ctx: { providerID: ProviderV2.ID; aborted?: boolean; userCancelled?: boolean },
 ): NonNullable<Assistant["error"]> {
+  const headerTimeout = headerTimeoutError(e)
+  if (headerTimeout) {
+    if (ctx.userCancelled === true) {
+      return new AbortedError({ message: headerTimeout.message }, { cause: e }).toObject()
+    }
+    return new APIError(
+      {
+        message: headerTimeout.message,
+        isRetryable: true,
+        metadata: {
+          code: headerTimeout.code,
+          ...(headerTimeout.timeoutMs === undefined ? {} : { timeoutMs: String(headerTimeout.timeoutMs) }),
+        },
+      },
+      { cause: e },
+    ).toObject()
+  }
+
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
       return new AbortedError(
@@ -646,18 +693,6 @@ export function fromError(
           metadata: {
             code: (e as FetchDecompressionError).code,
             message: e.message,
-          },
-        },
-        { cause: e },
-      ).toObject()
-    case e instanceof ProviderError.HeaderTimeoutError:
-      return new APIError(
-        {
-          message: e.message,
-          isRetryable: true,
-          metadata: {
-            code: e.name,
-            timeoutMs: String(e.ms),
           },
         },
         { cause: e },

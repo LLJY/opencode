@@ -9,6 +9,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderError } from "../../src/provider/error"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -988,7 +989,7 @@ describe("session.message-v2.toModelMessage", () => {
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
   })
 
-  test("includes aborted assistant messages only when they have non-step-start/reasoning content", async () => {
+  test("omits aborted assistant partial text and reasoning from model history", async () => {
     const assistantID1 = "m-assistant-1"
     const assistantID2 = "m-assistant-2"
 
@@ -1030,13 +1031,120 @@ describe("session.message-v2.toModelMessage", () => {
       },
     ]
 
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
+  test("preserves completed tool call and result pairs from aborted assistant messages", async () => {
+    const userID = "m-user-aborted-tool"
+    const assistantID = "m-assistant-aborted-tool"
+    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
+
+    const input: MessageV2.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1-aborted-tool"), type: "text", text: "run tool" }] as MessageV2.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID, aborted),
+        parts: [
+          { ...basePart(assistantID, "a1-aborted-tool"), type: "text", text: "partial answer" },
+          {
+            ...basePart(assistantID, "a2-aborted-tool"),
+            type: "tool",
+            callID: "call-aborted-completed",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: { cmd: "pwd" },
+              output: "ok",
+              title: "Bash",
+              metadata: {},
+              time: { start: 0, end: 1 },
+            },
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "run tool" }],
+      },
       {
         role: "assistant",
         content: [
-          { type: "reasoning", text: "thinking", providerOptions: undefined },
-          { type: "text", text: "partial answer" },
+          {
+            type: "tool-call",
+            toolCallId: "call-aborted-completed",
+            toolName: "bash",
+            input: { cmd: "pwd" },
+            providerExecuted: undefined,
+          },
         ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-aborted-completed",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ])
+  })
+
+  test("drops interrupted pending and running tool parts from aborted assistant messages", async () => {
+    const userID = "m-user-aborted-dropped-tools"
+    const assistantID = "m-assistant-aborted-dropped-tools"
+    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
+
+    const input: MessageV2.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" }] as MessageV2.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID, aborted),
+        parts: [
+          {
+            ...basePart(assistantID, "a1-aborted-dropped-tools"),
+            type: "tool",
+            callID: "call-interrupted",
+            tool: "bash",
+            state: {
+              status: "error",
+              input: { cmd: "sleep" },
+              error: "Tool execution aborted",
+              metadata: { interrupted: true, output: "partial" },
+              time: { start: 0, end: 1 },
+            },
+          },
+          {
+            ...basePart(assistantID, "a2-aborted-dropped-tools"),
+            type: "tool",
+            callID: "call-pending-aborted",
+            tool: "bash",
+            state: { status: "pending", input: { cmd: "pwd" }, raw: "{}" },
+          },
+          {
+            ...basePart(assistantID, "a3-aborted-dropped-tools"),
+            type: "tool",
+            callID: "call-running-aborted",
+            tool: "bash",
+            state: { status: "running", input: { cmd: "ls" }, time: { start: 0 } },
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "run tools" }],
       },
     ])
   })
@@ -1551,6 +1659,31 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(zlibError, { providerID, aborted: true })
 
     expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("classifies exact header timeout as retryable APIError without user cancellation", () => {
+    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
+      providerID,
+    })
+
+    expect(MessageV2.APIError.isInstance(result)).toBe(true)
+    expect((result as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
+    expect((result as MessageV2.APIError).data.isRetryable).toBe(true)
+
+    const direct = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
+    expect(MessageV2.APIError.isInstance(direct)).toBe(true)
+    expect((direct as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
+  })
+
+  test("classifies exact abort-shaped header timeout as AbortedError with user cancellation", () => {
+    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
+      providerID,
+      userCancelled: true,
+    })
+
+    expect(MessageV2.AbortedError.isInstance(result)).toBe(true)
+    if (!MessageV2.AbortedError.isInstance(result)) throw new Error("expected aborted error")
+    expect(result.data.message).toBe("Provider response headers timed out after 10000ms")
   })
 })
 

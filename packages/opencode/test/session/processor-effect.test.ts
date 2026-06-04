@@ -764,16 +764,18 @@ isolatedIt.live("session.processor effect tests retry native stream_incomplete L
 
         const effect = Effect.gen(function* () {
           const { processors, session, provider } = yield* boot()
-          const bus = yield* Bus.Service
+          const events = yield* EventV2Bridge.Service
 
           const chat = yield* session.create({})
           const parent = yield* user(chat.id, "native stream incomplete")
           const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
           const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
           const states: number[] = []
-          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
-            if (evt.properties.sessionID !== chat.id) return
-            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+            if (data.sessionID === chat.id && data.status.type === "retry") states.push(data.status.attempt)
+            return Effect.void
           })
           const handle = yield* processors.create({
             assistantMessage: msg,
@@ -789,7 +791,7 @@ isolatedIt.live("session.processor effect tests retry native stream_incomplete L
               time: parent.time,
               agent: parent.agent,
               model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies MessageV2.User,
+            } satisfies SessionV1.User,
             sessionID: chat.id,
             model: mdl,
             agent: agent(),
@@ -798,12 +800,149 @@ isolatedIt.live("session.processor effect tests retry native stream_incomplete L
             tools: {},
           })
 
-          off()
+          yield* off
 
           expect(value).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(states).toStrictEqual([1])
           expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests retry exact header timeout abort without user cancellation", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.fail(new DOMException("Provider response headers timed out after 10000ms", "AbortError")),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "after" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "header timeout")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const states: number[] = []
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+            if (data.sessionID === chat.id && data.status.type === "retry") states.push(data.status.attempt)
+            return Effect.void
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "header timeout" }],
+            tools: {},
+          })
+
+          yield* off
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(states).toStrictEqual([1])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests treats user-cancelled stream failure as abort without retry", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.fail(
+            new ProviderError.ResponseStreamError("stream_incomplete: Upstream closed before response.completed", {
+              transport: "sse",
+              phase: "before_first_event",
+              autoReplaySafe: true,
+            }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "cancelled stream incomplete")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const states: number[] = []
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+            if (data.sessionID === chat.id && data.status.type === "retry") states.push(data.status.attempt)
+            return Effect.void
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            wasCancelled: Effect.succeed(true),
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cancelled stream incomplete" }],
+            tools: {},
+          })
+
+          yield* off
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(states).toStrictEqual([])
+          expect(handle.message.error?.name).toBe("MessageAbortedError")
         })
 
         yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
@@ -839,16 +978,18 @@ isolatedIt.live("session.processor effect tests rollback retryable stream_incomp
 
         const effect = Effect.gen(function* () {
           const { processors, session, provider } = yield* boot()
-          const bus = yield* Bus.Service
+          const events = yield* EventV2Bridge.Service
 
           const chat = yield* session.create({})
           const parent = yield* user(chat.id, "provider stream incomplete")
           const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
           const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
           const states: number[] = []
-          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
-            if (evt.properties.sessionID !== chat.id) return
-            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+            if (data.sessionID === chat.id && data.status.type === "retry") states.push(data.status.attempt)
+            return Effect.void
           })
           const handle = yield* processors.create({
             assistantMessage: msg,
@@ -864,7 +1005,7 @@ isolatedIt.live("session.processor effect tests rollback retryable stream_incomp
               time: parent.time,
               agent: parent.agent,
               model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies MessageV2.User,
+            } satisfies SessionV1.User,
             sessionID: chat.id,
             model: mdl,
             agent: agent(),
@@ -873,15 +1014,15 @@ isolatedIt.live("session.processor effect tests rollback retryable stream_incomp
             tools: {},
           })
 
-          off()
+          yield* off
 
-          const parts = MessageV2.parts(msg.id)
+          const parts = yield* MessageV2.parts(msg.id)
 
           expect(value).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(states).toStrictEqual([1])
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
             "after",
           ])
           expect(handle.message.error).toBeUndefined()
@@ -917,16 +1058,18 @@ isolatedIt.live("session.processor effect tests do not replay arbitrary retryabl
 
         const effect = Effect.gen(function* () {
           const { processors, session, provider } = yield* boot()
-          const bus = yield* Bus.Service
+          const events = yield* EventV2Bridge.Service
 
           const chat = yield* session.create({})
           const parent = yield* user(chat.id, "generic retryable provider error")
           const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
           const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
           const states: number[] = []
-          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
-            if (evt.properties.sessionID !== chat.id) return
-            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as typeof SessionStatus.Event.Status.data.Type
+            if (data.sessionID === chat.id && data.status.type === "retry") states.push(data.status.attempt)
+            return Effect.void
           })
           const handle = yield* processors.create({
             assistantMessage: msg,
@@ -942,7 +1085,7 @@ isolatedIt.live("session.processor effect tests do not replay arbitrary retryabl
               time: parent.time,
               agent: parent.agent,
               model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies MessageV2.User,
+            } satisfies SessionV1.User,
             sessionID: chat.id,
             model: mdl,
             agent: agent(),
@@ -951,7 +1094,7 @@ isolatedIt.live("session.processor effect tests do not replay arbitrary retryabl
             tools: {},
           })
 
-          off()
+          yield* off
 
           expect(value).toBe("stop")
           expect(llm.calls).toBe(1)
@@ -1172,7 +1315,7 @@ isolatedIt.live("session.processor effect tests do not resume unsafe response.fa
               time: parent.time,
               agent: parent.agent,
               model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies MessageV2.User,
+            } satisfies SessionV1.User,
             sessionID: chat.id,
             model: mdl,
             agent: agent(),
@@ -1181,8 +1324,8 @@ isolatedIt.live("session.processor effect tests do not resume unsafe response.fa
             tools: {},
           })
 
-          const parts = MessageV2.parts(msg.id)
-          const text = parts.find((part): part is MessageV2.TextPart => part.type === "text")
+          const parts = yield* MessageV2.parts(msg.id)
+          const text = parts.find((part): part is SessionV1.TextPart => part.type === "text")
 
           expect(value).toBe("stop")
           expect(llm.calls).toBe(1)
