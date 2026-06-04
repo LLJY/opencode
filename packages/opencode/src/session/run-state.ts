@@ -11,6 +11,8 @@ import { SessionStatus } from "./status"
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly cancelProbe: (sessionID: SessionID) => Effect.Effect<Effect.Effect<boolean>>
+  readonly wasCancelled: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -26,6 +28,15 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
 
+type CancelProbe = {
+  cancelled: boolean
+}
+
+type CancelProbes = {
+  active?: CancelProbe
+  queued?: CancelProbe
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -36,6 +47,7 @@ const layer = Layer.effect(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const cancelled = new Map<SessionID, CancelProbes>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -43,9 +55,10 @@ const layer = Layer.effect(
               discard: true,
             })
             runners.clear()
+            cancelled.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, cancelled, scope }
       }),
     )
 
@@ -75,14 +88,32 @@ const layer = Layer.effect(
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      if (!existing) {
+      if (!existing || !existing.busy) {
+        data.cancelled.delete(sessionID)
+        yield* cancelBackgroundJobs(background, sessionID)
         yield* status.set(sessionID, { type: "idle" })
         return
       }
+      const probes = data.cancelled.get(sessionID) ?? {}
+      const probe = probes.active ?? probes.queued ?? { cancelled: false }
+      probe.cancelled = true
+      probes.active = probe
+      data.cancelled.set(sessionID, probes)
+      yield* cancelBackgroundJobs(background, sessionID)
       yield* existing.cancel
+    })
+
+    const cancelProbe = Effect.fn("SessionRunState.cancelProbe")(function* (sessionID: SessionID) {
+      const probe = (yield* InstanceState.get(state)).cancelled.get(sessionID)?.active
+      if (!probe) return Effect.succeed(false)
+      return Effect.sync(() => probe.cancelled)
+    })
+
+    const wasCancelled = Effect.fn("SessionRunState.wasCancelled")(function* (sessionID: SessionID) {
+      const probes = (yield* InstanceState.get(state)).cancelled.get(sessionID)
+      return probes?.active?.cancelled ?? probes?.queued?.cancelled ?? false
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -90,7 +121,21 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      const data = yield* InstanceState.get(state)
+      const current = yield* runner(sessionID, onInterrupt)
+      switch (current.state._tag) {
+        case "Idle": {
+          const probe = installActiveProbe(data.cancelled, sessionID)
+          return yield* current.ensureRunning(work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))))
+        }
+        case "Shell": {
+          const probe = installQueuedProbe(data.cancelled, sessionID)
+          return yield* current.ensureRunning(activateQueuedProbe(data.cancelled, sessionID, probe, work))
+        }
+        case "Running":
+        case "ShellThenRun":
+          return yield* current.ensureRunning(work)
+      }
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -99,12 +144,18 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+      const data = yield* InstanceState.get(state)
+      const current = yield* runner(sessionID, onInterrupt)
+      if (current.state._tag !== "Idle") {
+        return yield* current.startShell(work, ready).pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      }
+      const probe = installActiveProbe(data.cancelled, sessionID)
+      return yield* current
+        .startShell(work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))), ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, cancelProbe, wasCancelled, ensureRunning, startShell })
   }),
 )
 
@@ -144,6 +195,45 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+function installActiveProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID) {
+  const probe = { cancelled: false }
+  probes.set(sessionID, { active: probe })
+  return probe
+}
+
+function installQueuedProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID) {
+  const probe = { cancelled: false }
+  const current = probes.get(sessionID) ?? {}
+  current.queued = probe
+  probes.set(sessionID, current)
+  return probe
+}
+
+function activateQueuedProbe(
+  probes: Map<SessionID, CancelProbes>,
+  sessionID: SessionID,
+  probe: CancelProbe,
+  work: Effect.Effect<SessionV1.WithParts>,
+) {
+  return Effect.gen(function* () {
+    const current = probes.get(sessionID) ?? {}
+    current.active = probe
+    if (current.queued === probe) current.queued = undefined
+    probes.set(sessionID, current)
+    return yield* work.pipe(Effect.ensuring(clearActiveProbe(probes, sessionID, probe)))
+  })
+}
+
+function clearActiveProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID, probe: CancelProbe) {
+  return Effect.sync(() => {
+    const current = probes.get(sessionID)
+    if (!current || current.active !== probe) return
+    current.active = undefined
+    if (current.queued) return
+    probes.delete(sessionID)
+  })
 }
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
