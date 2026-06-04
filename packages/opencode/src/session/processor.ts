@@ -113,6 +113,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  wasCancelled?: Effect.Effect<boolean>
 }
 
 export interface Interface {
@@ -185,13 +186,20 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let cancelledByUser = false
       let replayState = captureReplayState()
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
+          userCancelled: cancelledByUser,
         })
+
+      const refreshCancelledByUser = Effect.fn("SessionProcessor.refreshCancelledByUser")(function* () {
+        cancelledByUser = cancelledByUser || (yield* (input.wasCancelled ?? Effect.succeed(false)))
+        return cancelledByUser
+      })
 
       function captureReplayState(): ReplayState {
         return {
@@ -834,6 +842,11 @@ const layer = Layer.effect(
       const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
         Effect.gen(function* () {
           const candidate = normalizeNativeResponseStreamError(error) ?? error
+          yield* refreshCancelledByUser()
+          if (cancelledByUser && cancelInducedTransportCandidate(candidate)) {
+            aborted = true
+            return abortFromCandidate(candidate)
+          }
           const retryable =
             candidate instanceof ProviderError.ResponseStreamError
               ? { message: candidate.message }
@@ -904,6 +917,7 @@ const layer = Layer.effect(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
                 aborted = true
+                yield* refreshCancelledByUser()
                 if (!ctx.assistantMessage.error) {
                   yield* halt(new DOMException("Aborted", "AbortError"))
                 }
@@ -998,6 +1012,20 @@ function nativeOpenAIResponseTransport(input: unknown): ProviderError.ResponseSt
 
 function responseStreamErrorMessage(value: string | undefined) {
   return value !== undefined && RESPONSE_STREAM_ERROR_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+function cancelInducedTransportCandidate(error: unknown) {
+  if (error instanceof ProviderError.ResponseStreamError) return true
+  if (error instanceof ProviderError.HeaderTimeoutError) return true
+  return error instanceof Error && error.name === "AbortError" && exactHeaderTimeoutMessage(error.message)
+}
+
+function abortFromCandidate(error: unknown) {
+  return new DOMException(errorMessage(error), "AbortError")
+}
+
+function exactHeaderTimeoutMessage(message: string) {
+  return /^Provider response headers timed out after \d+ms$/.test(message)
 }
 
 export const node = LayerNode.make({
