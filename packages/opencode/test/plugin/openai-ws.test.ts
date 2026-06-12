@@ -806,7 +806,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("prunes HTTP fallback after a websocket connection limit error", async () => {
+  test("keeps HTTP fallback after a websocket connection limit error", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -836,7 +836,7 @@ describe("plugin.openai.ws-pool", () => {
     const second = await fetch(server.url, streamRequest())
 
     expect(await second.text()).toBe("http")
-    expect(connections).toBe(2)
+    expect(connections).toBe(1)
     expect(server.httpRequests).toHaveLength(2)
     fetch.close()
   })

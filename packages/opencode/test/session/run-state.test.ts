@@ -1,8 +1,9 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Effect, Exit, Fiber } from "effect"
-import { ModelID, ProviderID } from "@/provider/schema"
-import { MessageV2 } from "@/session/message-v2"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { awaitWithTimeout, testEffect } from "../lib/effect"
@@ -272,7 +273,7 @@ describe("SessionRunState", () => {
   )
 })
 
-function assistant(sessionID: SessionID): MessageV2.WithParts {
+function assistant(sessionID: SessionID): SessionV1.WithParts {
   return {
     info: {
       id: MessageID.make("msg_cancel_probe_race_assistant"),
@@ -280,8 +281,8 @@ function assistant(sessionID: SessionID): MessageV2.WithParts {
       role: "assistant",
       parentID: MessageID.make("msg_cancel_probe_race_user"),
       time: { created: 0 },
-      modelID: ModelID.make("test-model"),
-      providerID: ProviderID.make("test"),
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
       mode: "build",
       agent: "build",
       path: { cwd: "/tmp", root: "/tmp" },
