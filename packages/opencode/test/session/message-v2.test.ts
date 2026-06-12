@@ -1037,12 +1037,12 @@ describe("session.message-v2.toModelMessage", () => {
   test("preserves completed tool call and result pairs from aborted assistant messages", async () => {
     const userID = "m-user-aborted-tool"
     const assistantID = "m-assistant-aborted-tool"
-    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
+    const aborted = new SessionV1.AbortedError({ message: "aborted" }).toObject() as SessionV1.Assistant["error"]
 
-    const input: MessageV2.WithParts[] = [
+    const input: SessionV1.WithParts[] = [
       {
         info: userInfo(userID),
-        parts: [{ ...basePart(userID, "u1-aborted-tool"), type: "text", text: "run tool" }] as MessageV2.Part[],
+        parts: [{ ...basePart(userID, "u1-aborted-tool"), type: "text", text: "run tool" }] as SessionV1.Part[],
       },
       {
         info: assistantInfo(assistantID, userID, aborted),
@@ -1062,7 +1062,7 @@ describe("session.message-v2.toModelMessage", () => {
               time: { start: 0, end: 1 },
             },
           },
-        ] as MessageV2.Part[],
+        ] as SessionV1.Part[],
       },
     ]
 
@@ -1100,12 +1100,12 @@ describe("session.message-v2.toModelMessage", () => {
   test("drops interrupted pending and running tool parts from aborted assistant messages", async () => {
     const userID = "m-user-aborted-dropped-tools"
     const assistantID = "m-assistant-aborted-dropped-tools"
-    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
+    const aborted = new SessionV1.AbortedError({ message: "aborted" }).toObject() as SessionV1.Assistant["error"]
 
-    const input: MessageV2.WithParts[] = [
+    const input: SessionV1.WithParts[] = [
       {
         info: userInfo(userID),
-        parts: [{ ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" }] as MessageV2.Part[],
+        parts: [{ ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" }] as SessionV1.Part[],
       },
       {
         info: assistantInfo(assistantID, userID, aborted),
@@ -1137,7 +1137,7 @@ describe("session.message-v2.toModelMessage", () => {
             tool: "bash",
             state: { status: "running", input: { cmd: "ls" }, time: { start: 0 } },
           },
-        ] as MessageV2.Part[],
+        ] as SessionV1.Part[],
       },
     ]
 
@@ -1666,13 +1666,13 @@ describe("session.message-v2.fromError", () => {
       providerID,
     })
 
-    expect(MessageV2.APIError.isInstance(result)).toBe(true)
-    expect((result as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
-    expect((result as MessageV2.APIError).data.isRetryable).toBe(true)
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
+    expect((result as SessionV1.APIError).data.isRetryable).toBe(true)
 
     const direct = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
-    expect(MessageV2.APIError.isInstance(direct)).toBe(true)
-    expect((direct as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
+    expect(SessionV1.APIError.isInstance(direct)).toBe(true)
+    expect((direct as SessionV1.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
   })
 
   test("classifies exact abort-shaped header timeout as AbortedError with user cancellation", () => {
@@ -1681,8 +1681,8 @@ describe("session.message-v2.fromError", () => {
       userCancelled: true,
     })
 
-    expect(MessageV2.AbortedError.isInstance(result)).toBe(true)
-    if (!MessageV2.AbortedError.isInstance(result)) throw new Error("expected aborted error")
+    expect(SessionV1.AbortedError.isInstance(result)).toBe(true)
+    if (!SessionV1.AbortedError.isInstance(result)) throw new Error("expected aborted error")
     expect(result.data.message).toBe("Provider response headers timed out after 10000ms")
   })
 })
