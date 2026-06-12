@@ -525,8 +525,4 @@ function eventErrorCode(event: Record<string, unknown>) {
   return typeof error.code === "string" ? error.code : undefined
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
-
 export * as OpenAIWebSocket from "./ws"
