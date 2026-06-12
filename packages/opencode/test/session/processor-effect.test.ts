@@ -1,4 +1,5 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -9,7 +10,6 @@ import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
-import { Permission } from "../../src/permission"
 import { ProviderError } from "../../src/provider/error"
 import { Provider } from "@/provider/provider"
 import { BackgroundJob } from "@/background/job"
@@ -1330,8 +1330,8 @@ isolatedIt.live("session.processor effect tests do not resume unsafe response.fa
           expect(value).toBe("stop")
           expect(llm.calls).toBe(1)
           expect(text?.text).toBe("partial")
-          expect(MessageV2.APIError.isInstance(handle.message.error)).toBe(true)
-          if (MessageV2.APIError.isInstance(handle.message.error)) {
+          expect(SessionV1.APIError.isInstance(handle.message.error)).toBe(true)
+          if (SessionV1.APIError.isInstance(handle.message.error)) {
             expect(handle.message.error.data.metadata?.terminalEvent).toBe("response.failed")
             expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("false")
           }
@@ -2041,7 +2041,7 @@ isolatedIt.live("session.processor effect tests stop after denied tool boundary 
               id: "call_2",
               name: "lookup",
               message: "permission denied",
-              error: new Permission.RejectedError(),
+              error: new PermissionV1.RejectedError(),
             }),
           ).pipe(
             Stream.concat(
@@ -2125,7 +2125,7 @@ isolatedIt.live("session.processor effect tests do not retry plain-text rate lim
               id: "call_2",
               name: "lookup",
               message: "permission denied",
-              error: new Permission.RejectedError(),
+              error: new PermissionV1.RejectedError(),
             }),
           ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
         )

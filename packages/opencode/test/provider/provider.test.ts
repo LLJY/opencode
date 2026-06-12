@@ -136,9 +136,9 @@ experimentalWebSockets.instance(
   Effect.gen(function* () {
     yield* setProcessEnv("OPENCODE_AUTH_CONTENT", "{}")
     const providers = yield* list
-    expect(providers[ProviderID.openai]).toBeDefined()
-    expect(providers[ProviderID.openai].options.baseURL).toBe("https://api.openai.com/v1")
-    expect(providers[ProviderID.openai].options.fetch).toBeFunction()
+    expect(providers[ProviderV2.ID.openai]).toBeDefined()
+    expect(providers[ProviderV2.ID.openai].options.baseURL).toBe("https://api.openai.com/v1")
+    expect(providers[ProviderV2.ID.openai].options.fetch).toBeFunction()
   }),
   {
     config: {
@@ -159,10 +159,10 @@ experimentalWebSockets.instance("openai env apiKey installs websocket fetch with
     yield* setProcessEnv("OPENCODE_AUTH_CONTENT", "{}")
     yield* setProcessEnv("OPENAI_API_KEY", "test-openai-key")
     const providers = yield* list
-    expect(providers[ProviderID.openai]).toBeDefined()
-    expect(providers[ProviderID.openai].source).toBe("env")
-    expect(providers[ProviderID.openai].key).toBe("test-openai-key")
-    expect(providers[ProviderID.openai].options.fetch).toBeFunction()
+    expect(providers[ProviderV2.ID.openai]).toBeDefined()
+    expect(providers[ProviderV2.ID.openai].source).toBe("env")
+    expect(providers[ProviderV2.ID.openai].key).toBe("test-openai-key")
+    expect(providers[ProviderV2.ID.openai].options.fetch).toBeFunction()
   }),
 )
 
