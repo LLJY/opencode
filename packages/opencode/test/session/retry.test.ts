@@ -245,7 +245,7 @@ describe("session.retry.retryable", () => {
       ),
       { providerID },
     )
-    expect(MessageV2.APIError.isInstance(request)).toBe(true)
+    expect(SessionV1.APIError.isInstance(request)).toBe(true)
     expect(SessionRetry.retryable(request, retryProvider)).toBeUndefined()
   })
 
@@ -258,7 +258,7 @@ describe("session.retry.retryable", () => {
       }),
       { providerID },
     )
-    expect(MessageV2.APIError.isInstance(request)).toBe(true)
+    expect(SessionV1.APIError.isInstance(request)).toBe(true)
     expect(SessionRetry.retryable(request, retryProvider)).toBeUndefined()
   })
 
