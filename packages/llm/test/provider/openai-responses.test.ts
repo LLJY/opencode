@@ -1393,6 +1393,278 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("marks retryable response.failed after output unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              {
+                type: "response.failed",
+                response: {
+                  error: {
+                    code: "stream_incomplete",
+                    message: "Upstream websocket closed before response.completed",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "stream_incomplete: Upstream websocket closed before response.completed",
+        retryable: true,
+        providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("marks retryable response.failed after output item start unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1", summary: [] } },
+              {
+                type: "response.failed",
+                response: {
+                  error: {
+                    code: "stream_incomplete",
+                    message: "Upstream websocket closed before response.completed",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "stream_incomplete: Upstream websocket closed before response.completed",
+        retryable: true,
+        providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("marks retryable failed response.done after output unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              {
+                type: "response.done",
+                response: {
+                  status: "failed",
+                  error: {
+                    code: "stream_incomplete",
+                    message: "Upstream websocket closed before response.completed",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "stream_incomplete: Upstream websocket closed before response.completed",
+        retryable: true,
+        providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("marks retryable unknown response.done after output unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              {
+                type: "response.done",
+                response: {
+                  status: "cancelled",
+                  error: {
+                    code: "stream_incomplete",
+                    message: "Upstream websocket closed before response.completed",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "stream_incomplete: Upstream websocket closed before response.completed",
+        retryable: true,
+        providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("marks failed response.done after output with retryable-looking message unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              {
+                type: "response.done",
+                response: {
+                  status: "failed",
+                  error: {
+                    code: "rate_limit_exceeded",
+                    message: "Rate limit reached",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "rate_limit_exceeded: Rate limit reached",
+        providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("marks unknown response.done after output with retryable-looking message unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              {
+                type: "response.done",
+                response: {
+                  status: "cancelled",
+                  error: {
+                    message: "Too many requests",
+                  },
+                },
+              },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "Too many requests",
+        providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
+      })
+    }),
+  )
+
+  it.effect("maps response.incomplete max_output_tokens to length finish", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "response.incomplete",
+              response: { id: "resp_incomplete", incomplete_details: { reason: "max_output_tokens" } },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toMatchObject([
+        { type: "step-start", index: 0 },
+        { type: "step-finish", index: 0, reason: "length" },
+        { type: "finish", reason: "length" },
+      ])
+    }),
+  )
+
+  it.effect("maps incomplete response.done to an incomplete finish", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "response.done",
+              response: {
+                id: "resp_done_incomplete",
+                status: "incomplete",
+                incomplete_details: { reason: "max_output_tokens" },
+              },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toMatchObject([
+        { type: "step-start", index: 0 },
+        { type: "step-finish", index: 0, reason: "length" },
+        { type: "finish", reason: "length" },
+      ])
+    }),
+  )
+
+  it.effect("emits provider-error for failed response.done terminals", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "response.done",
+              response: {
+                id: "resp_done_failed",
+                status: "failed",
+                error: { code: "server_error", message: "Upstream model unavailable" },
+              },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "server_error: Upstream model unavailable",
+          providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: true } },
+        },
+      ])
+    }),
+  )
+
+  it.effect("emits provider-error for unknown response.done terminals", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(sseEvents({ type: "response.done", response: { id: "resp_done_unknown", status: "cancelled" } })),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "OpenAI Responses response ended with status cancelled",
+          providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: true } },
+        },
+      ])
+    }),
+  )
+
   it.effect("falls back to error code when no message is present", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
@@ -1433,7 +1705,13 @@ describe("OpenAI Responses route", () => {
         ),
       )
 
-      expect(response.events).toEqual([{ type: "provider-error", message: "server_error: Upstream model unavailable" }])
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "server_error: Upstream model unavailable",
+          providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: true } },
+        },
+      ])
     }),
   )
 
@@ -1450,7 +1728,13 @@ describe("OpenAI Responses route", () => {
         ),
       )
 
-      expect(response.events).toEqual([{ type: "provider-error", message: "invalid_prompt" }])
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "invalid_prompt",
+          providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: true } },
+        },
+      ])
     }),
   )
 
@@ -1498,7 +1782,13 @@ describe("OpenAI Responses route", () => {
         Effect.provide(fixedResponse(sseEvents({ type: "response.failed", response: { id: "resp_failed_3" } }))),
       )
 
-      expect(response.events).toEqual([{ type: "provider-error", message: "OpenAI Responses response failed" }])
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "OpenAI Responses response failed",
+          providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: true } },
+        },
+      ])
     }),
   )
 
