@@ -37,6 +37,8 @@ export interface WrappedError {
   body: string
 }
 
+const idleErrorHandlers = new WeakSet<WebSocket>()
+
 export function toWebSocketUrl(url: string) {
   return url.replace(/^http/, "ws")
 }
@@ -161,6 +163,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
 
   function closeCompleted() {
     cleanup()
+    ensureIdleErrorHandler(socket)
     controller?.enqueue(encoder.encode("data: [DONE]\n\n"))
     controller?.close()
   }
@@ -264,15 +267,16 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    const transportTerminalError = event && terminalTransportError(event, failure)
+    const normalizedEvent = normalizeTerminalEvent(event)
+    const transportTerminalError = normalizedEvent && terminalTransportError(normalizedEvent, failure)
     if (transportTerminalError) {
-      failTerminal(event, transportTerminalError)
+      failTerminal(normalizedEvent, transportTerminalError)
       return
     }
 
     controller?.enqueue(
       encoder.encode(
-        `${text
+        `${(normalizedEvent === event ? text : JSON.stringify(normalizedEvent))
           .split(/\r?\n/)
           .map((line) => `data: ${line}`)
           .join("\n")}\n\n`,
@@ -283,50 +287,69 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     if (event && modelOutputEvent(event)) emittedModelOutput = true
     resetIdleTimeout("idle timeout waiting for websocket")
 
-    if (!event) return
+    if (!normalizedEvent) return
 
-    if (event.type === "response.completed") {
+    if (normalizedEvent.type === "response.completed") {
       completed = true
-      options.onComplete?.(event)
-      options.onTerminal?.(event)
+      options.onComplete?.(normalizedEvent)
+      options.onTerminal?.(normalizedEvent)
       release()
       closeCompleted()
       return
     }
 
-    if (event.type === "response.done") {
-      const status = responseStatus(event)
+    if (normalizedEvent.type === "response.done") {
+      const status = responseStatus(normalizedEvent)
       if (status === "completed") {
         completed = true
-        options.onComplete?.(event)
-        options.onTerminal?.(event)
+        options.onComplete?.(normalizedEvent)
+        options.onTerminal?.(normalizedEvent)
         release()
         closeCompleted()
         return
       }
       if (status === "incomplete") {
-        failTerminal(event, failure("OpenAI response incomplete", event))
+        completed = true
+        options.onComplete?.(normalizedEvent)
+        options.onTerminal?.(normalizedEvent)
+        release()
+        closeCompleted()
         return
       }
       release()
-      failTerminal(event, new Error(`OpenAI response ended with status ${status ?? "unknown"}`, { cause: event }))
-      return
-    }
-
-    if (event.type === "response.incomplete") {
-      failTerminal(event, failure("OpenAI response incomplete", event))
-      return
-    }
-
-    if (event.type === "error") {
-      if (!transportErrorEvent(event)) release()
       failTerminal(
-        event,
-        transportErrorEvent(event)
-          ? failure(eventErrorMessage(event), event)
-          : new Error(eventErrorMessage(event), { cause: event }),
+        normalizedEvent,
+        failure(`OpenAI response ended with status ${status ?? "unknown"}`, normalizedEvent, {
+          terminalEvent: normalizedEvent.type,
+        }),
+      )
+      return
+    }
+
+    if (normalizedEvent.type === "response.incomplete") {
+      completed = true
+      options.onComplete?.(normalizedEvent)
+      options.onTerminal?.(normalizedEvent)
+      release()
+      closeCompleted()
+      return
+    }
+
+    if (normalizedEvent.type === "error") {
+      if (!transportErrorEvent(normalizedEvent)) release()
+      failTerminal(
+        normalizedEvent,
+        transportErrorEvent(normalizedEvent)
+          ? failure(eventErrorMessage(normalizedEvent), normalizedEvent)
+          : new Error(eventErrorMessage(normalizedEvent), { cause: normalizedEvent }),
       )
     }
+  }
+
+  function onRawMessage(data: WebSocket.RawData, isBinary: boolean) {
+    void onMessage(data, isBinary).catch((error) => {
+      invalidate(failure(error instanceof Error ? error.message : String(error), error))
+    })
   }
 
   function onError(error: Error) {
@@ -359,11 +382,11 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
   function attach(next: WebSocket) {
     cleanupSocket()
     socket = next
-    socket.on("message", onMessage)
+    socket.on("message", onRawMessage)
     socket.once("error", onError)
     socket.once("close", onClose)
     cleanupSocket = () => {
-      socket.off("message", onMessage)
+      socket.off("message", onRawMessage)
       socket.off("error", onError)
       socket.off("close", onClose)
     }
@@ -446,6 +469,14 @@ function responseStatus(event: Record<string, unknown>) {
   return typeof response.status === "string" ? response.status : undefined
 }
 
+function normalizeTerminalEvent(event: Record<string, unknown> | undefined) {
+  if (event?.type !== "response.done") return event
+  const status = responseStatus(event)
+  if (status === "completed") return { ...event, type: "response.completed" }
+  if (status === "incomplete") return { ...event, type: "response.incomplete" }
+  return event
+}
+
 function terminalTransportError(
   event: Record<string, unknown>,
   failure: (
@@ -455,11 +486,18 @@ function terminalTransportError(
   ) => ProviderError.ResponseStreamError,
 ) {
   if (event.type === "response.failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
-  if (event.type === "response.incomplete") return failure("OpenAI response incomplete", event)
-  if (event.type === "response.done" && responseStatus(event) === "incomplete") {
-    return failure("OpenAI response incomplete", event)
+  if (event.type === "response.done") {
+    const status = responseStatus(event)
+    if (status === "failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
+    return failure(`OpenAI response ended with status ${status ?? "unknown"}`, event, { terminalEvent: event.type })
   }
   if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
+}
+
+function ensureIdleErrorHandler(socket: WebSocket) {
+  if (idleErrorHandlers.has(socket)) return
+  idleErrorHandlers.add(socket)
+  socket.on("error", () => {})
 }
 
 function responseFailedMessage(event: Record<string, unknown>) {
@@ -495,9 +533,11 @@ function modelOutputEvent(event: Record<string, unknown>) {
   if (event.type === "response.reasoning_text.delta") return true
   if (event.type === "response.reasoning_summary.delta") return true
   if (event.type === "response.reasoning_summary_text.delta") return true
+  if (event.type === "response.reasoning_summary_part.added") return true
+  if (event.type === "response.content_part.added") return true
   if (event.type.endsWith(".delta") && event.type.includes("call")) return true
   if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
-    return isRecord(event.item) && event.item.type !== "message"
+    return isRecord(event.item)
   }
   return false
 }
