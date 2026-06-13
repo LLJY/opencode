@@ -237,6 +237,7 @@ type OpenAIResponsesEvent = Schema.Schema.Type<typeof OpenAIResponsesEvent>
 interface ParserState {
   readonly tools: ToolStream.State<string>
   readonly hasFunctionCall: boolean
+  readonly hasModelOutput: boolean
   readonly lifecycle: Lifecycle.State
   readonly reasoningItems: Readonly<Record<string, ReasoningStreamItem>>
   readonly store: boolean | undefined
@@ -609,15 +610,20 @@ const NO_EVENTS: StepResult["1"] = []
 
 // `response.completed` / `response.incomplete` are clean finishes that emit a
 // `finish` event; `response.failed` is a hard failure that emits a
-// `provider-error`. All three end the stream — kept in one set so `step` and
-// the protocol's `terminal` predicate stay in sync.
-const TERMINAL_TYPES = new Set(["response.completed", "response.incomplete", "response.failed"])
+// `provider-error`. Some transports surface the terminal as `response.done`
+// with `response.status`; keep the set in sync with `step` so every terminal
+// is parsed before the stream stops.
+const TERMINAL_TYPES = new Set(["response.completed", "response.incomplete", "response.failed", "response.done"])
 
 const onOutputTextDelta = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
   if (!event.delta) return [state, NO_EVENTS]
   const events: LLMEvent[] = []
   return [
-    { ...state, lifecycle: Lifecycle.textDelta(state.lifecycle, events, event.item_id ?? "text-0", event.delta) },
+    {
+      ...state,
+      hasModelOutput: true,
+      lifecycle: Lifecycle.textDelta(state.lifecycle, events, event.item_id ?? "text-0", event.delta),
+    },
     events,
   ]
 }
@@ -631,6 +637,7 @@ const onReasoningDelta = (state: ParserState, event: OpenAIResponsesEvent): Step
   return [
     {
       ...state,
+      hasModelOutput: true,
       lifecycle: Lifecycle.reasoningDelta(state.lifecycle, events, id, event.delta),
     },
     events,
@@ -661,6 +668,7 @@ const onOutputItemAdded = (state: ParserState, event: OpenAIResponsesEvent): Ste
     return [
       {
         ...state,
+        hasModelOutput: true,
         lifecycle: Lifecycle.reasoningStart(state.lifecycle, events, `${item.id}:0`, reasoningMetadata(item)),
         reasoningItems: {
           ...state.reasoningItems,
@@ -670,7 +678,9 @@ const onOutputItemAdded = (state: ParserState, event: OpenAIResponsesEvent): Ste
       events,
     ]
   }
-  if (item?.type !== "function_call" || !item.id) return [state, NO_EVENTS]
+  if (item?.type !== "function_call" || !item.id) {
+    return [item ? { ...state, hasModelOutput: true } : state, NO_EVENTS]
+  }
   const providerMetadata = openaiMetadata({ itemId: item.id })
   const events: LLMEvent[] = []
   const lifecycle = Lifecycle.stepStart(state.lifecycle, events)
@@ -678,6 +688,7 @@ const onOutputItemAdded = (state: ParserState, event: OpenAIResponsesEvent): Ste
     {
       ...state,
       lifecycle,
+      hasModelOutput: true,
       hasFunctionCall: state.hasFunctionCall,
       tools: ToolStream.start(state.tools, item.id, {
         id: item.call_id ?? item.id,
@@ -699,6 +710,7 @@ const onReasoningSummaryPartAdded = (state: ParserState, event: OpenAIResponsesE
     return [
       {
         ...state,
+        hasModelOutput: true,
         lifecycle: Lifecycle.reasoningStart(
           state.lifecycle,
           events,
@@ -730,6 +742,7 @@ const onReasoningSummaryPartAdded = (state: ParserState, event: OpenAIResponsesE
   return [
     {
       ...state,
+      hasModelOutput: true,
       lifecycle: Lifecycle.reasoningStart(
         closed,
         events,
@@ -763,6 +776,7 @@ const onReasoningSummaryPartDone = (state: ParserState, event: OpenAIResponsesEv
   return [
     {
       ...state,
+      hasModelOutput: events.length > 0 ? true : state.hasModelOutput,
       lifecycle:
         state.store !== false
           ? Lifecycle.reasoningEnd(
@@ -803,7 +817,10 @@ const onFunctionCallArgumentsDelta = Effect.fn("OpenAIResponses.onFunctionCallAr
   const events: LLMEvent[] = []
   const lifecycle = result.events.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
   events.push(...result.events)
-  return [{ ...state, lifecycle, tools: result.tools }, events] satisfies StepResult
+  return [
+    { ...state, hasModelOutput: result.events.length > 0 ? true : state.hasModelOutput, lifecycle, tools: result.tools },
+    events,
+  ] satisfies StepResult
 })
 
 const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function* (
@@ -829,6 +846,7 @@ const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function*
     return [
       {
         ...state,
+        hasModelOutput: resultEvents.length > 0 ? true : state.hasModelOutput,
         lifecycle,
         hasFunctionCall: resultEvents.some(LLMEvent.is.toolCall) ? true : state.hasFunctionCall,
         tools: result.tools,
@@ -841,7 +859,7 @@ const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function*
     const events: LLMEvent[] = []
     const lifecycle = Lifecycle.stepStart(state.lifecycle, events)
     events.push(...hostedToolEvents(item))
-    return [{ ...state, lifecycle }, events] satisfies StepResult
+    return [{ ...state, hasModelOutput: true, lifecycle }, events] satisfies StepResult
   }
 
   if (isReasoningItem(item)) {
@@ -856,16 +874,19 @@ const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function*
           state.lifecycle,
         )
       const { [item.id]: _removed, ...reasoningItems } = state.reasoningItems
-      return [{ ...state, lifecycle, reasoningItems }, events] satisfies StepResult
+      return [
+        { ...state, hasModelOutput: events.length > 0 ? true : state.hasModelOutput, lifecycle, reasoningItems },
+        events,
+      ] satisfies StepResult
     }
     if (!state.lifecycle.reasoning.has(item.id)) {
       const lifecycle = Lifecycle.stepStart(state.lifecycle, events)
       events.push(LLMEvent.reasoningStart({ id: item.id, providerMetadata }))
       events.push(LLMEvent.reasoningEnd({ id: item.id, providerMetadata }))
-      return [{ ...state, lifecycle }, events] satisfies StepResult
+      return [{ ...state, hasModelOutput: true, lifecycle }, events] satisfies StepResult
     }
     return [
-      { ...state, lifecycle: Lifecycle.reasoningEnd(state.lifecycle, events, item.id, providerMetadata) },
+      { ...state, hasModelOutput: true, lifecycle: Lifecycle.reasoningEnd(state.lifecycle, events, item.id, providerMetadata) },
       events,
     ] satisfies StepResult
   }
@@ -889,6 +910,12 @@ const onResponseFinish = (state: ParserState, event: OpenAIResponsesEvent): Step
   return [{ ...state, lifecycle }, events]
 }
 
+const responseDoneStatus = (event: OpenAIResponsesEvent) => {
+  const response = event.response
+  if (!ProviderShared.isRecord(response)) return undefined
+  return typeof response.status === "string" ? response.status : undefined
+}
+
 // Build a single human-readable message from whatever the provider supplied.
 // When both code and message are present, prefix the code so consumers see
 // the failure mode (e.g. `rate_limit_exceeded: Slow down`) instead of just
@@ -903,13 +930,18 @@ const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): st
   return message || code || fallback
 }
 
-const providerError = (event: OpenAIResponsesEvent, fallback: string) => {
-  const code = event.code || event.response?.error?.code || undefined
+const providerError = (event: OpenAIResponsesEvent, fallback: string, state?: ParserState) => {
+  const code = event.code || event.error?.code || event.response?.error?.code || undefined
   const message = providerErrorMessage(event, fallback)
+  const retryable = isStreamIncompleteProviderError(event)
+  const terminalEvent = event.type === "response.failed" || event.type === "response.done" ? event.type : undefined
   return LLMEvent.providerError({
     message,
     classification: code === "context_length_exceeded" || isContextOverflow(message) ? "context-overflow" : undefined,
-    ...(isStreamIncompleteProviderError(event) ? { retryable: true } : {}),
+    ...(retryable ? { retryable: true } : {}),
+    ...(terminalEvent
+      ? { providerMetadata: openaiMetadata({ terminalEvent, autoReplaySafe: !state?.hasModelOutput }) }
+      : {}),
   })
 }
 
@@ -926,8 +958,14 @@ const isStreamIncompleteProviderError = (event: OpenAIResponsesEvent) => {
 
 const onResponseFailed = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
   state,
-  [providerError(event, "OpenAI Responses response failed")],
+  [providerError(event, "OpenAI Responses response failed", state)],
 ]
+
+const onResponseDone = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
+  const status = responseDoneStatus(event)
+  if (status === "completed" || status === "incomplete") return onResponseFinish(state, event)
+  return [state, [providerError(event, `OpenAI Responses response ended with status ${status ?? "unknown"}`, state)]]
+}
 
 const onError = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
   state,
@@ -958,6 +996,7 @@ const step = (state: ParserState, event: OpenAIResponsesEvent) => {
   if (event.type === "response.completed" || event.type === "response.incomplete")
     return Effect.succeed(onResponseFinish(state, event))
   if (event.type === "response.failed") return Effect.succeed(onResponseFailed(state, event))
+  if (event.type === "response.done") return Effect.succeed(onResponseDone(state, event))
   if (event.type === "error") return Effect.succeed(onError(state, event))
   return Effect.succeed<StepResult>([state, NO_EVENTS])
 }
@@ -980,6 +1019,7 @@ export const protocol = Protocol.make({
     event: Protocol.jsonEvent(OpenAIResponsesEvent),
     initial: (request) => ({
       hasFunctionCall: false,
+      hasModelOutput: false,
       tools: ToolStream.empty<string>(),
       lifecycle: Lifecycle.initial(),
       reasoningItems: {},
