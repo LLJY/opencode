@@ -285,6 +285,21 @@ const layer = Layer.effect(
         })
       }
 
+      function providerErrorStreamInfo(value: Extract<StreamEvent, { type: "provider-error" }>) {
+        const openai = isRecord(value.providerMetadata?.openai) ? value.providerMetadata.openai : undefined
+        const autoReplaySafe = typeof openai?.autoReplaySafe === "boolean" ? openai.autoReplaySafe : undefined
+        return {
+          ...currentResponseStreamInfo(value.message),
+          ...(autoReplaySafe === undefined
+            ? {}
+            : {
+                phase: autoReplaySafe ? "before_first_event" : "after_first_event",
+                autoReplaySafe,
+              }),
+          ...(typeof openai?.terminalEvent === "string" ? { terminalEvent: openai.terminalEvent } : {}),
+        } satisfies ProviderError.ResponseStreamInfo
+      }
+
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
         delete ctx.toolcalls[toolCallID]
@@ -595,6 +610,13 @@ const layer = Layer.effect(
           }
 
           case "provider-error": {
+            if (value.classification === "context-overflow") {
+              throw new SessionV1.ContextOverflowError({ message: value.message }).toObject()
+            }
+            const streamInfo = providerErrorStreamInfo(value)
+            if (streamInfo.terminalEvent || (value.retryable === true && responseStreamErrorMessage(value.message))) {
+              throw new ProviderError.ResponseStreamError(value.message, streamInfo)
+            }
             const error = new Error(value.message)
             throw value.retryable === true ? (normalizeRetryableProviderStreamError(value.message, error) ?? error) : error
           }
@@ -990,11 +1012,19 @@ const layer = Layer.effect(
 )
 
 function unsafeTerminalFailure(error: ProviderError.ResponseStreamError) {
-  return error.info.terminalEvent === "response.failed" && !error.info.autoReplaySafe
+  return (
+    (error.info.terminalEvent === "response.failed" || error.info.terminalEvent === "response.done") &&
+    !error.info.autoReplaySafe
+  )
 }
 
 const RESPONSE_STREAM_ERROR_PATTERNS = [/stream[_ ]incomplete/i, /before\s+response\.completed/i]
-const OPENAI_RESPONSE_STREAM_ROUTES = new Set(["openai/openai-responses", "openai/openai-responses-websocket"])
+const OPENAI_RESPONSE_STREAM_ROUTES = new Set([
+  "openai-responses",
+  "openai-responses-websocket",
+  "openai/openai-responses",
+  "openai/openai-responses-websocket",
+])
 
 function nativeOpenAIResponseStreamMessage(input: unknown) {
   if (!(input instanceof LLMError)) return undefined
@@ -1006,7 +1036,8 @@ function nativeOpenAIResponseStreamMessage(input: unknown) {
 function nativeOpenAIResponseTransport(input: unknown): ProviderError.ResponseStreamInfo["transport"] | undefined {
   if (!(input instanceof LLMError)) return undefined
   if (input.reason._tag !== "InvalidProviderOutput") return undefined
-  if (input.reason.route === "openai/openai-responses-websocket") return "websocket"
+  if (input.reason.route === "openai-responses-websocket" || input.reason.route === "openai/openai-responses-websocket")
+    return "websocket"
   return undefined
 }
 
