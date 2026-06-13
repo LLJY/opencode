@@ -29,6 +29,7 @@ import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
+import { LLMError } from "@opencode-ai/llm"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
@@ -664,6 +665,27 @@ export function fromError(
       ).toObject()
     case OutputLengthError.isInstance(e):
       return e
+    case ContextOverflowError.isInstance(e):
+      return e
+    case APIError.isInstance(e):
+      return e
+    case e instanceof LLMError && "classification" in e.reason && e.reason.classification === "context-overflow":
+      return new ContextOverflowError(
+        {
+          message: e.reason.message,
+          responseBody: "http" in e.reason ? e.reason.http?.body : undefined,
+        },
+        { cause: e },
+      ).toObject()
+    case e instanceof LLMError:
+      return new APIError(
+        {
+          message: e.reason.message,
+          isRetryable: e.retryable,
+          responseBody: "http" in e.reason ? e.reason.http?.body : undefined,
+        },
+        { cause: e },
+      ).toObject()
     case LoadAPIKeyError.isInstance(e):
       return new AuthError(
         {

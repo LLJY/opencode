@@ -31,6 +31,7 @@ import { registerAdapter } from "@/control-plane/adapters"
 import type { WorkspaceAdapter } from "@/control-plane/types"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstallationChannel } from "@opencode-ai/core/installation/version"
 
 type State = {
   hooks: Hooks[]
@@ -57,9 +58,8 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
 
-export function experimentalWebSocketsEnabled(_input: { enabled: boolean; channel?: string }) {
-  // Downstream override: force websocket transport on all channels for local validation.
-  return true
+export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel?: string }) {
+  return input.enabled || ["local", "dev", "beta"].includes(input.channel ?? InstallationChannel)
 }
 
 // Built-in plugins that are directly imported (not installed from npm)
