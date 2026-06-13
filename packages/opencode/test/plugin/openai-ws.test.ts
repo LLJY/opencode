@@ -67,7 +67,7 @@ describe("plugin.openai.ws", () => {
     expect(invalid).toEqual(["idle timeout sending websocket request"])
   })
 
-  test("streams websocket events as SSE and handles response.done", async () => {
+  test("streams websocket events as SSE and normalizes completed response.done", async () => {
     let requestBody: unknown
     await using server = await createWebSocketServer((socket) => {
       socket.once("message", (data) => {
@@ -90,19 +90,24 @@ describe("plugin.openai.ws", () => {
     })
 
     expect(await response.text()).toBe(
-      'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: {"type":"response.done","response":{"id":"resp_123","status":"completed"}}\n\ndata: [DONE]\n\n',
+      'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: {"type":"response.completed","response":{"id":"resp_123","status":"completed"}}\n\ndata: [DONE]\n\n',
     )
     expect(requestBody).toEqual({ type: "response.create", input: "hi" })
     expect(completed).toHaveLength(1)
-    expect(completed[0]?.type).toBe("response.done")
+    expect(completed[0]?.type).toBe("response.completed")
   })
 
-  test("treats response.incomplete as a stream failure", async () => {
+  test("normalizes incomplete response.done as a normal incomplete finish", async () => {
     const terminal: Record<string, unknown>[] = []
-    const invalid: ProviderError.ResponseStreamError[] = []
+    const completed: Record<string, unknown>[] = []
     await using server = await createWebSocketServer((socket) => {
       socket.once("message", () => {
-        socket.send(JSON.stringify({ type: "response.incomplete", response: { id: "resp_123", status: "incomplete" } }))
+        socket.send(
+          JSON.stringify({
+            type: "response.done",
+            response: { id: "resp_123", status: "incomplete", incomplete_details: { reason: "max_output_tokens" } },
+          }),
+        )
       })
     })
 
@@ -110,17 +115,61 @@ describe("plugin.openai.ws", () => {
     const response = OpenAIWebSocket.streamResponsesWebSocket({
       socket,
       body: { stream: true, input: "hi" },
+      onComplete: (event) => completed.push(event),
       onTerminal: (event) => terminal.push(event),
-      onConnectionInvalid: (error) => invalid.push(error),
     })
 
-    expect((await readTextError(response.text())).message).toContain("OpenAI response incomplete")
+    expect(await response.text()).toBe(
+      'data: {"type":"response.incomplete","response":{"id":"resp_123","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}\n\ndata: [DONE]\n\n',
+    )
+    expect(completed.map((event) => event.type)).toEqual(["response.incomplete"])
     expect(terminal.map((event) => event.type)).toEqual(["response.incomplete"])
-    expect(invalid[0]?.info).toEqual({
-      transport: "websocket",
-      phase: "before_first_event",
-      autoReplaySafe: true,
+  })
+
+  test("treats response.incomplete as a normal incomplete finish", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const completed: Record<string, unknown>[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.incomplete",
+            response: { id: "resp_123", status: "incomplete", incomplete_details: { reason: "max_output_tokens" } },
+          }),
+        )
+      })
     })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onComplete: (event) => completed.push(event),
+      onTerminal: (event) => terminal.push(event),
+    })
+
+    expect(await response.text()).toBe(
+      'data: {"type":"response.incomplete","response":{"id":"resp_123","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}\n\ndata: [DONE]\n\n',
+    )
+    expect(completed.map((event) => event.type)).toEqual(["response.incomplete"])
+    expect(terminal.map((event) => event.type)).toEqual(["response.incomplete"])
+  })
+
+  test("leaves completed idle sockets with a safe error listener", async () => {
+    const socket = new (class extends EventEmitter {
+      send(_data: string, callback: (error?: Error) => void) {
+        this.emit("message", Buffer.from(JSON.stringify({ type: "response.completed", response: { id: "resp_123" } })), false)
+        callback()
+      }
+      terminate() {}
+    })() as unknown as WebSocket
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+    })
+
+    expect(await response.text()).toContain("data: [DONE]")
+    expect(() => socket.emit("error", new Error("idle boom"))).not.toThrow()
   })
 
   test("treats response.failed as a retryable stream failure before the first event", async () => {
@@ -161,6 +210,110 @@ describe("plugin.openai.ws", () => {
       phase: "before_first_event",
       autoReplaySafe: true,
       terminalEvent: "response.failed",
+    })
+  })
+
+  test("treats failed response.done as a connection-invalid terminal failure", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.done",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: { code: "server_error", message: "The model failed to generate a response." },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (server_error): The model failed to generate a response.",
+    )
+    expect(terminal.map((event) => event.type)).toEqual(["response.done"])
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+      terminalEvent: "response.done",
+    })
+  })
+
+  test("treats unknown response.done status as a connection-invalid terminal failure", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.done", response: { id: "resp_123", status: "cancelled" } }))
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain("OpenAI response ended with status cancelled")
+    expect(terminal.map((event) => event.type)).toEqual(["response.done"])
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+      terminalEvent: "response.done",
+    })
+  })
+
+  test("marks failed response.done after emitted content unsafe to replay", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.done",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: { code: "rate_limit_exceeded", message: "Rate limit reached" },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (rate_limit_exceeded): Rate limit reached",
+    )
+    expect(terminal.map((event) => event.type)).toEqual(["response.done"])
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "after_first_event",
+      autoReplaySafe: false,
+      terminalEvent: "response.done",
     })
   })
 
@@ -537,12 +690,50 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const firstText = first.text()
     fetch.remove("session-1")
-    expect((await readTextError(firstText)).message).toContain("WebSocket closed before response.completed")
+    expect((await readTextError(firstText)).message).toContain("WebSocket session removed")
 
     const second = await fetch(server.url, streamRequest())
 
     expect(await second.text()).toContain("data: [DONE]")
     expect(connections).toBe(2)
+    fetch.close()
+  })
+
+  test("close aborts pre-first-event websocket requests without HTTP replay", async () => {
+    let messages = 0
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        messages += 1
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      idleTimeout: 1_000,
+    })
+
+    const response = fetch(server.url, streamRequest())
+    await waitFor(() => messages === 1, "websocket request did not start")
+    fetch.close()
+
+    await expect(response).rejects.toThrow("WebSocket pool closed")
+    expect(server.httpRequests).toHaveLength(0)
+  })
+
+  test("remove aborts connecting websocket requests without HTTP replay", async () => {
+    await using server = await createHangingTcpServer()
+    await using fallback = await createHttpServer()
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      connectTimeout: 1_000,
+      streamRetries: 0,
+    })
+
+    const response = fetch(fallback.url, streamRequest())
+    await waitFor(() => server.connections() === 1, "websocket did not begin connecting")
+    fetch.remove("session-1")
+
+    await expect(response).rejects.toThrow("WebSocket session removed")
+    expect(fallback.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -606,6 +797,59 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("falls back to HTTP after failed response.done before the first event", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.done",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: { code: "server_error", message: "The model failed to generate a response." },
+            },
+          }),
+        )
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    const second = await fetch(server.url, streamRequest())
+
+    expect(await first.text()).toBe("http")
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(2)
+    fetch.close()
+  })
+
+  test("falls back to HTTP after unknown response.done before the first event", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.done", response: { id: "resp_123", status: "cancelled" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    const second = await fetch(server.url, streamRequest())
+
+    expect(await first.text()).toBe("http")
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(2)
+    fetch.close()
+  })
+
   test("activates HTTP fallback after lifecycle-only response.failed", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
@@ -653,23 +897,26 @@ describe("plugin.openai.ws-pool", () => {
       connections += 1
       socket.once("message", () => {
         socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
-        socket.send(
-          JSON.stringify({
-            type: "response.failed",
-            response: {
-              id: "resp_123",
-              status: "failed",
-              error: {
-                code: "server_error",
-                message: "The model failed to generate a response.",
+        setTimeout(() => {
+          socket.send(
+            JSON.stringify({
+              type: "response.failed",
+              response: {
+                id: "resp_123",
+                status: "failed",
+                error: {
+                  code: "server_error",
+                  message: "The model failed to generate a response.",
+                },
               },
-            },
-          }),
-        )
+            }),
+          )
+        }, 5)
       })
     })
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
       url: server.url,
+      streamRetries: 0,
     })
 
     const first = await fetch(server.url, streamRequest())
@@ -848,14 +1095,18 @@ describe("plugin.openai.ws-pool", () => {
       connections += 1
       socket.once("message", () => {
         socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
-        socket.send(
-          JSON.stringify({
-            type: "error",
-            error: {
-              code: "stream_incomplete",
-              message: "Upstream websocket closed before response.completed",
-            },
-          }),
+        setTimeout(
+          () =>
+            socket.send(
+              JSON.stringify({
+                type: "error",
+                error: {
+                  code: "stream_incomplete",
+                  message: "Upstream websocket closed before response.completed",
+                },
+              }),
+            ),
+          50,
         )
       })
     })
