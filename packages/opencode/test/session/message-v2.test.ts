@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
+import { InvalidRequestReason, LLMError } from "@opencode-ai/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
@@ -1594,6 +1595,24 @@ describe("session.message-v2.fromError", () => {
     })
     const result = MessageV2.fromError(error, { providerID })
     expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+  })
+
+  test("preserves context overflow classification from native LLMError", () => {
+    const result = MessageV2.fromError(
+      new LLMError({
+        module: "RequestExecutor",
+        method: "execute",
+        reason: new InvalidRequestReason({
+          message: "context_length_exceeded: prompt too long",
+          classification: "context-overflow",
+        }),
+      }),
+      { providerID },
+    )
+
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+    if (!SessionV1.ContextOverflowError.isInstance(result)) throw new Error("expected context overflow")
+    expect(result.data.message).toBe("context_length_exceeded: prompt too long")
   })
 
   test("does not classify 429 no body as context overflow", () => {

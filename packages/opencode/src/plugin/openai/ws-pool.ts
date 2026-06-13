@@ -21,6 +21,11 @@ interface PoolEntry {
   busy: boolean
   fallback: boolean
   streamFailures: number
+  removed?: boolean
+  abortReason?: DOMException
+  abort?: (reason?: unknown) => void
+  clearAbort?: () => void
+  idleCleanup?: () => void
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -81,6 +86,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
     entry.busy = true
     entry.lastUsedAt = Date.now()
+    const signal = prepareAbort(entry, init?.signal)
     try {
       entry.socket = await socket(
         entry,
@@ -88,8 +94,12 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         OpenAIWebSocket.normalizeHeaders(httpInit?.headers),
         connectTimeout,
         maxConnectionAge,
-        init?.signal,
+        signal,
       )
+      if (entry.removed || signal.aborted) {
+        invalidate(entry)
+        throw entryAbortError(signal)
+      }
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
       const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>((resolve, reject) => {
@@ -100,19 +110,27 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         socket: entry.socket,
         body,
         idleTimeout,
-        signal: init?.signal ?? undefined,
+        signal,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onTerminal: (event) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           entry.streamFailures = 0
-          if (event.type !== "response.completed" && event.type !== "response.done") {
-            invalidate(entry)
+          releaseAbort(entry)
+          if (expectedTerminalEvent(event)) {
+            armIdle(entry)
+            return
           }
+          invalidate(entry)
         },
         onConnectionInvalid: (error, closeCode) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
+          releaseAbort(entry)
+          if (entry.removed) {
+            rejectFirstEvent(entry.abortReason ?? new DOMException(error.message, "AbortError"))
+            return
+          }
           if (closeCode === OpenAIWebSocket.MESSAGE_TOO_BIG_CLOSE_CODE) entry.fallback = true
           else if (!entry.fallback) recordStreamFailure(entry)
           invalidate(entry)
@@ -122,6 +140,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           entry.streamFailures = 0
+          releaseAbort(entry)
           invalidate(entry)
           rejectFirstEvent(error)
         },
@@ -144,6 +163,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
+      releaseAbort(entry)
       if (OpenAIWebSocket.isAbortError(error)) {
         entry.streamFailures = 0
         invalidate(entry)
@@ -189,7 +209,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
   function close() {
     clearInterval(pruneTimer)
-    for (const entry of pool.values()) invalidate(entry)
+    for (const entry of pool.values()) abortEntry(entry, "WebSocket pool closed")
     pool.clear()
   }
 
@@ -197,11 +217,45 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     const key = `${sessionID}:conversation`
     const entry = pool.get(key)
     if (!entry) return
-    invalidate(entry)
+    abortEntry(entry, "WebSocket session removed")
     pool.delete(key)
   }
 
   return Object.assign(websocketFetch, { close, remove })
+}
+
+function prepareAbort(entry: PoolEntry, signal?: AbortSignal | null) {
+  releaseAbort(entry)
+  const abort = new AbortController()
+  const onAbort = () => abortEntryRequest(signal?.reason)
+  const abortEntryRequest = (reason?: unknown) => {
+    if (!abort.signal.aborted) abort.abort(reason)
+  }
+  entry.abort = abortEntryRequest
+  entry.clearAbort = () => {
+    signal?.removeEventListener("abort", onAbort)
+    if (entry.abort === abortEntryRequest) entry.abort = undefined
+    entry.clearAbort = undefined
+  }
+  if (signal?.aborted) abortEntryRequest(signal.reason)
+  else signal?.addEventListener("abort", onAbort, { once: true })
+  return abort.signal
+}
+
+function releaseAbort(entry: PoolEntry) {
+  entry.clearAbort?.()
+}
+
+function abortEntry(entry: PoolEntry, message: string) {
+  entry.removed = true
+  entry.abortReason = new DOMException(message, "AbortError")
+  entry.abort?.(entry.abortReason)
+  invalidate(entry)
+}
+
+function entryAbortError(signal: AbortSignal) {
+  if (OpenAIWebSocket.isAbortError(signal.reason)) return signal.reason
+  return new DOMException(signal.reason instanceof Error ? signal.reason.message : "Aborted", "AbortError")
 }
 
 function connectionLimitError(event: Record<string, unknown>) {
@@ -223,6 +277,32 @@ function failedResponse(error: ProviderError.ResponseStreamError) {
   )
 }
 
+function expectedTerminalEvent(event: Record<string, unknown>) {
+  if (event.type === "response.completed" || event.type === "response.incomplete") return true
+  return (
+    event.type === "response.done" && (responseStatus(event) === "completed" || responseStatus(event) === "incomplete")
+  )
+}
+
+function responseStatus(event: Record<string, unknown>) {
+  if (!isRecord(event.response)) return undefined
+  return typeof event.response.status === "string" ? event.response.status : undefined
+}
+
+function armIdle(entry: PoolEntry) {
+  const socket = entry.socket
+  if (!socket) return
+  entry.idleCleanup?.()
+  const onIdle = () => invalidate(entry)
+  socket.once("error", onIdle)
+  socket.once("close", onIdle)
+  entry.idleCleanup = () => {
+    socket.off("error", onIdle)
+    socket.off("close", onIdle)
+    entry.idleCleanup = undefined
+  }
+}
+
 async function socket(
   entry: PoolEntry,
   url: string,
@@ -236,6 +316,7 @@ async function socket(
     entry.connectedAt &&
     Date.now() - entry.connectedAt < maxConnectionAge
   ) {
+    entry.idleCleanup?.()
     return entry.socket
   }
 
@@ -253,6 +334,7 @@ async function socket(
 }
 
 function invalidate(entry: PoolEntry) {
+  entry.idleCleanup?.()
   if (entry.socket) {
     entry.socket.on("error", () => {})
     entry.socket.terminate()
