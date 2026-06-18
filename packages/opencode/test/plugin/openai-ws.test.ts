@@ -611,7 +611,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("falls back to HTTP immediately after websocket setup failure", async () => {
+  test("does not fall back to HTTP after websocket setup failure", async () => {
     const attempts: string[] = []
     await using server = await createRejectingWebSocketServer(() => attempts.push("websocket"))
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -624,18 +624,15 @@ describe("plugin.openai.ws-pool", () => {
     const second = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
     const third = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(await third.text()).toBe("http")
-    expect(attempts).toEqual(["websocket"])
-    expect(server.httpRequests).toHaveLength(3)
-    expect(server.httpRequests[0]?.headers[TITLE_HEADER]).toBeUndefined()
-    expect(server.httpRequests[1]?.headers[TITLE_HEADER]).toBeUndefined()
-    expect(server.httpRequests[2]?.headers[TITLE_HEADER]).toBeUndefined()
+    expect((await readTextError(first.text())).message).toContain("Expected 101 status code")
+    expect((await readTextError(second.text())).message).toContain("Expected 101 status code")
+    expect((await readTextError(third.text())).message).toContain("Expected 101 status code")
+    expect(attempts).toEqual(["websocket", "websocket", "websocket"])
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("keeps HTTP fallback active after its idle timeout", async () => {
+  test("keeps trying websockets after setup failure and idle timeout", async () => {
     let websocketAttempts = 0
     await using server = await createRejectingWebSocketServer(() => websocketAttempts++)
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -646,13 +643,13 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest())
-    expect(await first.text()).toBe("http")
+    expect((await readTextError(first.text())).message).toContain("Expected 101 status code")
     await new Promise((resolve) => setTimeout(resolve, 50))
     const second = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
-    expect(websocketAttempts).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(second.text())).message).toContain("Expected 101 status code")
+    expect(websocketAttempts).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -676,7 +673,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("removes HTTP fallback when its session is deleted", async () => {
+  test("removes failed websocket session entries without HTTP fallback", async () => {
     let websocketAttempts = 0
     await using server = await createRejectingWebSocketServer(() => websocketAttempts++)
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -686,13 +683,13 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest())
-    expect(await first.text()).toBe("http")
+    expect((await readTextError(first.text())).message).toContain("Expected 101 status code")
     fetch.remove("session-1")
     const second = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
+    expect((await readTextError(second.text())).message).toContain("Expected 101 status code")
     expect(websocketAttempts).toBe(2)
-    expect(server.httpRequests).toHaveLength(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -788,7 +785,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("falls back to HTTP after response.failed before the first event", async () => {
+  test("does not fall back to HTTP after response.failed before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -815,14 +812,14 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const second = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
+    expect((await readTextError(second.text())).message).toContain("OpenAI response failed")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("falls back to HTTP after failed response.done before the first event", async () => {
+  test("does not fall back to HTTP after failed response.done before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -846,14 +843,14 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const second = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
+    expect((await readTextError(second.text())).message).toContain("OpenAI response failed")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("falls back to HTTP after unknown response.done before the first event", async () => {
+  test("does not fall back to HTTP after unknown response.done before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -868,14 +865,14 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const second = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(first.text())).message).toContain("OpenAI response ended with status cancelled")
+    expect((await readTextError(second.text())).message).toContain("OpenAI response ended with status cancelled")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("activates HTTP fallback after lifecycle-only response.failed", async () => {
+  test("does not activate HTTP fallback after lifecycle-only response.failed", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -910,13 +907,13 @@ describe("plugin.openai.ws-pool", () => {
 
     const second = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(1)
+    expect((await readTextError(second.text())).message).toContain("OpenAI response failed")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("does not fall back to HTTP for the current response after output response.failed", async () => {
+  test("does not fall back to HTTP after output response.failed", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -949,9 +946,9 @@ describe("plugin.openai.ws-pool", () => {
 
     const second = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(1)
+    expect((await readTextError(second.text())).message).toContain("OpenAI response failed")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -1021,7 +1018,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("falls back to HTTP after a websocket connection limit error", async () => {
+  test("does not fall back to HTTP after a websocket connection limit error", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1046,14 +1043,14 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const second = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
+    expect((await readTextError(second.text())).message).toContain("Responses websocket connection limit reached")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("keeps HTTP fallback after a websocket connection limit error", async () => {
+  test("keeps trying websockets after a websocket connection limit error", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1078,17 +1075,17 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest())
-    expect(await first.text()).toBe("http")
+    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
     await new Promise((resolve) => setTimeout(resolve, 50))
     const second = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(second.text())).message).toContain("Responses websocket connection limit reached")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("uses sticky HTTP fallback after a websocket failure mid-stream", async () => {
+  test("keeps websocket transport after a websocket failure mid-stream", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1105,16 +1102,15 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
     const second = await fetch(server.url, streamRequest())
+    expect((await readTextError(second.text())).message).toContain("WebSocket closed before response.completed")
     const third = await fetch(server.url, streamRequest())
-
-    expect(await second.text()).toBe("http")
-    expect(await third.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(third.text())).message).toContain("WebSocket closed before response.completed")
+    expect(connections).toBe(3)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("uses sticky HTTP fallback after a transport error frame mid-stream", async () => {
+  test("keeps websocket transport after a transport error frame mid-stream", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1143,16 +1139,15 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     expect((await readTextError(first.text())).message).toContain("Upstream websocket closed before response.completed")
     const second = await fetch(server.url, streamRequest())
+    expect((await readTextError(second.text())).message).toContain("Upstream websocket closed before response.completed")
     const third = await fetch(server.url, streamRequest())
-
-    expect(await second.text()).toBe("http")
-    expect(await third.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(third.text())).message).toContain("Upstream websocket closed before response.completed")
+    expect(connections).toBe(3)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
-  test("falls back to HTTP when websocket idles before the first event", async () => {
+  test("does not fall back to HTTP when websocket idles before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1168,11 +1163,11 @@ describe("plugin.openai.ws-pool", () => {
     const second = await fetch(server.url, streamRequest())
     const third = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(await third.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(3)
+    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
+    expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
+    expect((await readTextError(third.text())).message).toContain("idle timeout waiting for websocket")
+    expect(connections).toBe(3)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -1191,11 +1186,10 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
     const second = await fetch(server.url, streamRequest())
+    expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
     const third = await fetch(server.url, streamRequest())
-
-    expect(await second.text()).toBe("http")
-    expect(await third.text()).toBe("http")
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(third.text())).message).toContain("idle timeout waiting for websocket")
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
@@ -1258,13 +1252,13 @@ describe("plugin.openai.ws-pool", () => {
     const second = fetch(fallback.url, streamRequest())
 
     expect(await (await second).text()).toBe("http")
-    expect(await (await first).text()).toBe("http")
+    expect((await readTextError((await first).text())).message).toContain("WebSocket connect timed out")
     expect(server.connections()).toBe(1)
-    expect(fallback.httpRequests).toHaveLength(2)
+    expect(fallback.httpRequests).toHaveLength(1)
     fetch.close()
   })
 
-  test("falls back to HTTP after an unexpected websocket close before the first event", async () => {
+  test("does not fall back to HTTP after an unexpected websocket close before the first event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
@@ -1280,10 +1274,10 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     const second = await fetch(server.url, streamRequest())
 
-    expect(await first.text()).toBe("http")
-    expect(await second.text()).toBe("http")
-    expect(connections).toBe(1)
-    expect(server.httpRequests).toHaveLength(2)
+    expect((await readTextError(first.text())).message).toContain("server shutdown")
+    expect((await readTextError(second.text())).message).toContain("server shutdown")
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(0)
     fetch.close()
   })
 
