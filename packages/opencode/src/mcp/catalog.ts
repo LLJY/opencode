@@ -67,8 +67,8 @@ export function convertTool(mcpTool: MCPToolDef, client: Client, timeout?: numbe
       )
       if (result.isError)
         throw new Error(
-          result.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
+          (Array.isArray(result.content) ? result.content : [])
+            .flatMap((item) => (isTextContent(item) ? [item.text] : []))
             .filter((text) => text.trim())
             .join("\n\n") || "MCP tool returned an error",
         )
@@ -117,6 +117,17 @@ export function fetch<T extends { name: string }>(
 export const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_")
 
 export const toolName = (clientName: string, name: string) => sanitize(clientName) + "_" + sanitize(name)
+
+function isTextContent(value: unknown): value is { type: "text"; text: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "text" &&
+    "text" in value &&
+    typeof value.text === "string"
+  )
+}
 
 export function prompts(client: Client, timeout?: number) {
   if (!client.getServerCapabilities()?.prompts) return Promise.resolve([])

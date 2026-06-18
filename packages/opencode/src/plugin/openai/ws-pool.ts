@@ -11,6 +11,7 @@ export interface CreateWebSocketFetchOptions {
   connectTimeout?: number
   idleTimeout?: number
   maxConnectionAge?: number
+  /** @deprecated WebSocket failures no longer activate HTTP fallback; retained for compatibility. */
   streamRetries?: number
 }
 
@@ -20,13 +21,14 @@ interface PoolEntry {
   lastUsedAt: number
   busy: boolean
   fallback: boolean
-  streamFailures: number
   removed?: boolean
   abortReason?: DOMException
   abort?: (reason?: unknown) => void
   clearAbort?: () => void
   idleCleanup?: () => void
 }
+
+type FirstEvent = true | false | OpenAIWebSocket.WrappedError | ProviderError.ResponseStreamError
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
@@ -39,7 +41,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const connectTimeout = options?.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
   const idleTimeout = options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
   const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
-  const streamRetries = options?.streamRetries ?? 5
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (typeof pruneTimer === "object" && "unref" in pruneTimer && typeof pruneTimer.unref === "function") {
     pruneTimer.unref()
@@ -74,7 +75,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     }
     const key = `${sessionID}:conversation`
 
-    const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
+    const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false }
     pool.set(key, entry)
 
     if (entry.fallback) {
@@ -100,9 +101,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         invalidate(entry)
         throw entryAbortError(signal)
       }
-      let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
+      let resolveFirstEvent: (event: FirstEvent) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
-      const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>((resolve, reject) => {
+      const firstEvent = new Promise<FirstEvent>((resolve, reject) => {
         resolveFirstEvent = resolve
         rejectFirstEvent = reject
       })
@@ -115,7 +116,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         onTerminal: (event) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
-          entry.streamFailures = 0
           releaseAbort(entry)
           if (expectedTerminalEvent(event)) {
             armIdle(entry)
@@ -131,15 +131,17 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             rejectFirstEvent(entry.abortReason ?? new DOMException(error.message, "AbortError"))
             return
           }
-          if (closeCode === OpenAIWebSocket.MESSAGE_TOO_BIG_CLOSE_CODE) entry.fallback = true
-          else if (!entry.fallback) recordStreamFailure(entry)
           invalidate(entry)
-          if (error.info.autoReplaySafe) resolveFirstEvent(false)
+          if (closeCode === OpenAIWebSocket.MESSAGE_TOO_BIG_CLOSE_CODE) {
+            entry.fallback = true
+            resolveFirstEvent(false)
+            return
+          }
+          resolveFirstEvent(error)
         },
         onAbort: (error) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
-          entry.streamFailures = 0
           releaseAbort(entry)
           invalidate(entry)
           rejectFirstEvent(error)
@@ -151,30 +153,25 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         },
       })
       const first = await firstEvent
-      if (first !== false) {
-        if (first === true || first.status < 200 || first.status > 599) return response
-        return new Response(first.body, {
-          status: first.status,
-          headers: { "content-type": "application/json", ...first.headers },
-        })
-      }
-      if (!entry.fallback) return response
-      return httpFetch(input, httpInit)
+      if (first === false) return httpFetch(input, httpInit)
+      if (first instanceof ProviderError.ResponseStreamError) return failedResponse(first)
+      if (first === true) return response
+      if (first.status < 200 || first.status > 599) return response
+      return new Response(first.body, {
+        status: first.status,
+        headers: { "content-type": "application/json", ...first.headers },
+      })
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
       releaseAbort(entry)
       if (OpenAIWebSocket.isAbortError(error)) {
-        entry.streamFailures = 0
         invalidate(entry)
         throw error
       }
 
       const streamError = toWebSocketSetupError(error)
-      if (streamError) entry.fallback = true
-      if (!streamError) recordStreamFailure(entry)
       invalidate(entry)
-      if (entry.fallback) return httpFetch(input, httpInit)
       return failedResponse(
         streamError ??
           new ProviderError.ResponseStreamError(
@@ -188,12 +185,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           ),
       )
     }
-  }
-
-  function recordStreamFailure(entry: PoolEntry) {
-    entry.streamFailures++
-    // Codex counts retries after the initial failed WebSocket attempt.
-    if (entry.streamFailures > streamRetries) entry.fallback = true
   }
 
   function prune() {
