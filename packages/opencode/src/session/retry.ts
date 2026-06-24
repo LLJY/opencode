@@ -68,7 +68,12 @@ export function delay(attempt: number, error?: SessionV1.APIError, random = Math
         }
       }
 
-      return cap(exponential(attempt, random))
+      // Headers were present but carried no usable retry-after hint. Apply the
+      // same 30s cap as the no-headers branch so a flaky 5xx with normal
+      // response headers (content-type, date, ...) cannot grow the backoff
+      // past RETRY_MAX_DELAY_NO_HEADERS. Without this, attempt 10 waits ~17min,
+      // attempt 15 ~9h, attempt 20 ~12d.
+      return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
     }
   }
 
