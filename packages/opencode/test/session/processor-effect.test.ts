@@ -12,7 +12,6 @@ import z from "zod"
 import type { Agent } from "../../src/agent/agent"
 import { ProviderError } from "../../src/provider/error"
 import { Provider } from "@/provider/provider"
-import { BackgroundJob } from "@/background/job"
 
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
@@ -194,27 +193,12 @@ const env = LayerNode.compile(
 
 function processorLayer(
   llmLayer: Layer.Layer<LLM.Service>,
-  sessionLayer?: Layer.Layer<
-    Session.Service,
-    never,
-    BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
-  >,
+  sessionLayer?: Layer.Layer<Session.Service>,
 ) {
   if (sessionLayer) {
-    return LayerNode.buildLayer(root, {
-      replacements: [
-        ...replacements,
-        LayerNode.replace(LLM.node, llmLayer),
-        LayerNode.replaceWithNode(
-          Session.node,
-          LayerNode.make(sessionLayer, [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node]),
-        ),
-      ],
-    })
+    return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer], [Session.node, sessionLayer]])
   }
-  return LayerNode.buildLayer(root, {
-    replacements: [...replacements, LayerNode.replace(LLM.node, llmLayer)],
-  })
+  return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer]])
 }
 
 function rollbackFailureSessionLayer() {
@@ -234,11 +218,11 @@ function rollbackFailureSessionLayer() {
               }),
       })
     }),
-  ).pipe(Layer.provide(Session.layer))
+  ).pipe(Layer.provide(LayerNode.compile(Session.node)))
 }
 
 const it = testEffect(env)
-const isolatedIt = testEffect(CrossSpawnSpawner.defaultLayer)
+const isolatedIt = testEffect(LayerNode.compile(CrossSpawnSpawner.node))
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
