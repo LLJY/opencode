@@ -558,6 +558,7 @@ const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
 const OPENAI_EFFORTS = ["none", "minimal", ...WIDELY_SUPPORTED_EFFORTS, "xhigh"]
 const OPENAI_GPT5_1_EFFORTS = ["none", ...WIDELY_SUPPORTED_EFFORTS]
 const OPENAI_GPT5_2_PLUS_EFFORTS = [...OPENAI_GPT5_1_EFFORTS, "xhigh"]
+const OPENAI_GPT5_6_PLUS_EFFORTS = [...OPENAI_GPT5_2_PLUS_EFFORTS, "max"]
 const OPENAI_GPT5_PRO_EFFORTS = ["high"]
 const OPENAI_GPT5_PRO_2_PLUS_EFFORTS = ["medium", "high", "xhigh"]
 const OPENAI_GPT5_CHAT_EFFORTS = ["medium"]
@@ -589,6 +590,7 @@ function versionedGpt5ReasoningEfforts(apiId: string) {
   const version = gpt5Version(apiId)
   if (version === undefined) return undefined
   if (version === 1) return OPENAI_GPT5_1_EFFORTS
+  if (version >= 6) return OPENAI_GPT5_6_PLUS_EFFORTS
   return OPENAI_GPT5_2_PLUS_EFFORTS
 }
 
@@ -618,7 +620,7 @@ function openaiReasoningEfforts(apiId: string, releaseDate: string) {
   if (codexEfforts) return codexEfforts
   const versionedEfforts = versionedGpt5ReasoningEfforts(id)
   // GPT-5.1 replaced GPT-5's `minimal` effort with `none`; GPT-5.2+
-  // additionally accepts `xhigh`. Model pages list the supported subset.
+  // additionally accepts `xhigh`, and GPT-5.6+ accepts `max`.
   if (versionedEfforts) return versionedEfforts
   const efforts = [...WIDELY_SUPPORTED_EFFORTS]
   if (GPT5_FAMILY_RE.test(id)) efforts.unshift("minimal")
