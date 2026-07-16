@@ -26,19 +26,22 @@ export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const RETRY_MAX_ATTEMPTS = 5
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
 
 export function delay(attempt: number, error?: SessionV1.APIError) {
+  const exponentialMs = RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1)
   if (error) {
     const headers = error.data.responseHeaders
     if (headers) {
       const retryAfterMs = headers["retry-after-ms"]
       if (retryAfterMs) {
         const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
+        if (Number.isFinite(parsedMs)) {
+          if (parsedMs <= 0) return cap(exponentialMs)
           return cap(parsedMs)
         }
       }
@@ -46,7 +49,7 @@ export function delay(attempt: number, error?: SessionV1.APIError) {
       const retryAfter = headers["retry-after"]
       if (retryAfter) {
         const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
+        if (Number.isFinite(parsedSeconds) && parsedSeconds > 0) {
           // convert seconds to milliseconds
           return cap(Math.ceil(parsedSeconds * 1000))
         }
@@ -60,13 +63,12 @@ export function delay(attempt: number, error?: SessionV1.APIError) {
       // Headers were present but carried no usable retry-after hint. Apply the
       // same 30s cap as the no-headers branch so a flaky 5xx with normal
       // response headers (content-type, date, ...) cannot grow the backoff
-      // past RETRY_MAX_DELAY_NO_HEADERS. Without this, attempt 10 waits ~17min,
-      // attempt 15 ~9h, attempt 20 ~12d.
-      return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
+      // past RETRY_MAX_DELAY_NO_HEADERS.
+      return cap(Math.min(exponentialMs, RETRY_MAX_DELAY_NO_HEADERS))
     }
   }
 
-  return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
+  return cap(Math.min(exponentialMs, RETRY_MAX_DELAY_NO_HEADERS))
 }
 
 export function retryable(error: Err, provider: string) {
@@ -195,6 +197,7 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
+      if (meta.attempt > RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
