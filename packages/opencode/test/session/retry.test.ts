@@ -60,6 +60,20 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(8, error, 0)).toBe(30000)
   })
 
+  test("uses exponential backoff when retry-after-ms is zero", () => {
+    const error = apiError({ "retry-after-ms": "0" })
+    const delays = Array.from({ length: 5 }, (_, index) => SessionRetry.delay(index + 1, error))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000])
+  })
+
+  test.each(["-1", "Infinity"])("ignores invalid retry-after-ms value %s", (value) => {
+    expect(SessionRetry.delay(3, apiError({ "retry-after-ms": value }))).toBe(8000)
+  })
+
+  test.each(["0", "-1", "Infinity"])("ignores invalid retry-after seconds value %s", (value) => {
+    expect(SessionRetry.delay(3, apiError({ "retry-after": value }))).toBe(8000)
+  })
+
   test("prefers retry-after-ms when shorter than exponential", () => {
     const error = apiError({ "retry-after-ms": "1500" })
     expect(SessionRetry.delay(4, error)).toBe(1500)
@@ -110,7 +124,7 @@ describe("session.retry.delay", () => {
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
-      const error = apiError({ "retry-after-ms": "0" })
+      const error = apiError({ "retry-after-ms": "1" })
       const status = yield* SessionStatus.Service
 
       const step = yield* Schedule.toStepWithMetadata(

@@ -49,15 +49,13 @@ export function delay(attempt: number, error?: SessionV1.APIError, random = Math
       const retryAfterMs = headers["retry-after-ms"]
       if (retryAfterMs) {
         const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
+        if (Number.isFinite(parsedMs) && parsedMs > 0) return cap(parsedMs)
       }
 
       const retryAfter = headers["retry-after"]
       if (retryAfter) {
         const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
+        if (Number.isFinite(parsedSeconds) && parsedSeconds > 0) {
           // convert seconds to milliseconds
           return cap(Math.ceil(parsedSeconds * 1000))
         }
@@ -71,8 +69,7 @@ export function delay(attempt: number, error?: SessionV1.APIError, random = Math
       // Headers were present but carried no usable retry-after hint. Apply the
       // same 30s cap as the no-headers branch so a flaky 5xx with normal
       // response headers (content-type, date, ...) cannot grow the backoff
-      // past RETRY_MAX_DELAY_NO_HEADERS. Without this, attempt 10 waits ~17min,
-      // attempt 15 ~9h, attempt 20 ~12d.
+      // past RETRY_MAX_DELAY_NO_HEADERS.
       return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
     }
   }
