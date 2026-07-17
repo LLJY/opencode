@@ -93,6 +93,7 @@ type ReplayState = {
 
 export interface Handle {
   readonly message: SessionV1.Assistant
+  readonly responseId?: () => string | undefined
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
@@ -190,6 +191,17 @@ const layer = Layer.effect(
       let aborted = false
       let cancelledByUser = false
       let replayState = captureReplayState()
+      let responseId: string | undefined
+
+      const responseIdFromMetadata = (metadata: unknown) => {
+        if (!metadata || typeof metadata !== "object") return undefined
+        for (const value of Object.values(metadata)) {
+          if (!isRecord(value)) continue
+          const id = value.responseId
+          if (typeof id === "string") return id
+        }
+        return undefined
+      }
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -772,6 +784,7 @@ const layer = Layer.effect(
             return
 
           case "finish":
+            responseId = responseIdFromMetadata(value.providerMetadata)
             return
         }
       })
@@ -954,6 +967,9 @@ const layer = Layer.effect(
         return yield* Effect.gen(function* () {
           const outcome = yield* Effect.gen(function* () {
             resetAttemptState()
+            ctx.currentText = undefined
+            ctx.reasoningMap = {}
+            responseId = undefined
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
@@ -1028,6 +1044,7 @@ const layer = Layer.effect(
         get message() {
           return ctx.assistantMessage
         },
+        responseId: () => responseId,
         updateToolCall,
         completeToolCall,
         process,
