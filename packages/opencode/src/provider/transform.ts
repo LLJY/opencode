@@ -1222,7 +1222,6 @@ export function options(input: {
   model: Provider.Model
   sessionID: string
   providerOptions?: Record<string, any>
-  previousResponseId?: string
 }): Record<string, any> {
   const result: Record<string, any> = {}
 
@@ -1242,9 +1241,6 @@ export function options(input: {
     input.model.api.npm === "@ai-sdk/xai"
   ) {
     result["store"] = false
-    if (input.previousResponseId) {
-      result["previousResponseId"] = input.previousResponseId
-    }
   }
 
   if (input.model.api.npm === "@ai-sdk/azure") {
