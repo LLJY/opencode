@@ -1144,6 +1144,7 @@ const layer = Layer.effect(
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
+            previousResponseId = undefined
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             continue
           }
@@ -1290,7 +1291,6 @@ const layer = Layer.effect(
               toolChoice: format.type === "json_schema" ? "required" : undefined,
               previousResponseId,
             })
-
             previousResponseId = result === "continue" ? handle.responseId?.() : undefined
 
             if (structured !== undefined) {
