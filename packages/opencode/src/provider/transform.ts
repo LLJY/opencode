@@ -21,12 +21,6 @@ export const OUTPUT_TOKEN_MAX = 32_000
 // needed for stateless multi-turn reasoning (store: false). Hoisted so every
 // branch that requests it stays in lockstep.
 const INCLUDE_ENCRYPTED_REASONING = ["reasoning.encrypted_content"] as const
-const GPT56_PROMPT_CACHE_OPTIONS = { mode: "implicit", ttl: "30m" } as const
-
-function isGPT56Family(modelID: string) {
-  return /(?:^|[/.])gpt-5\.6(?:$|[-_/.])/.test(modelID.toLowerCase())
-}
-
 export function sanitizeSurrogates(content: string) {
   return content.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD")
 }
@@ -1199,9 +1193,6 @@ export function options(input: {
     }
   }
 
-  if (input.model.providerID === "openai" && isGPT56Family(input.model.api.id)) {
-    result["promptCacheOptions"] = GPT56_PROMPT_CACHE_OPTIONS
-  }
   if (input.model.providerID === "meta" && input.model.api.npm === "@ai-sdk/openai") {
     result["reasoningSummary"] = "auto"
     result["include"] = INCLUDE_ENCRYPTED_REASONING

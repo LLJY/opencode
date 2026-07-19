@@ -48,9 +48,6 @@ const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): Provide
   return { openai }
 }
 
-export const isGPT56Family = (modelID: string) =>
-  /(?:^|[/.])gpt-5\.6(?:$|[-_/.])/.test(modelID.toLowerCase())
-
 export const gpt5DefaultOptions = (
   modelID: string,
   options: { readonly textVerbosity?: boolean } = {},
@@ -73,23 +70,16 @@ export const gpt5DefaultOptions = (
   })
 }
 
-const gpt56DefaultOptions = (modelID: string): ProviderOptions | undefined =>
-  isGPT56Family(modelID) ? openAIProviderOptions({ promptCacheOptions: { mode: "implicit", ttl: "30m" } }) : undefined
-
 export const openAIDefaultOptions = (
   modelID: string,
-  options: { readonly textVerbosity?: boolean; readonly promptCaching?: boolean } = {},
+  options: { readonly textVerbosity?: boolean } = {},
 ): ProviderOptions | undefined =>
-  mergeProviderOptions(
-    openAIProviderOptions({ store: false }),
-    gpt5DefaultOptions(modelID, options),
-    options.promptCaching === true ? gpt56DefaultOptions(modelID) : undefined,
-  )
+  mergeProviderOptions(openAIProviderOptions({ store: false }), gpt5DefaultOptions(modelID, options))
 
 export const withOpenAIOptions = <Options extends { readonly providerOptions?: OpenAIProviderOptionsInput }>(
   modelID: string,
   options: Options,
-  defaults: { readonly textVerbosity?: boolean; readonly promptCaching?: boolean } = {},
+  defaults: { readonly textVerbosity?: boolean } = {},
 ): Omit<Options, "providerOptions"> & { readonly providerOptions?: ProviderOptions } => {
   return {
     ...options,
