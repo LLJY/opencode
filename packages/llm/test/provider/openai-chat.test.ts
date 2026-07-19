@@ -115,7 +115,7 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
-  it.effect("enables GPT-5.6 family prompt cache options by default", () =>
+  it.effect("does not enable unsupported GPT-5.6 prompt cache options by default", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
         LLM.request({
@@ -126,7 +126,7 @@ describe("OpenAI Chat route", () => {
       )
 
       expect(prepared.body.prompt_cache_key).toBe("session_123")
-      expect(prepared.body.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" })
+      expect(prepared.body).not.toHaveProperty("prompt_cache_options")
     }),
   )
 
