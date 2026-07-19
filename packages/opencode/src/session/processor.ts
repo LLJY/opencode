@@ -140,6 +140,7 @@ interface ProcessorContext extends Input {
   attemptPartIDs: PartID[]
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  hasOutput: boolean
 }
 
 type StreamEvent = LLMEvent
@@ -184,6 +185,7 @@ const layer = Layer.effect(
         attemptPartIDs: [],
         currentText: undefined,
         reasoningMap: {},
+        hasOutput: false,
       }
       let aborted = false
       let cancelledByUser = false
@@ -522,6 +524,7 @@ const layer = Layer.effect(
             }
             ctx.attemptHasToolActivity = true
             yield* ensureToolCall(value)
+            ctx.hasOutput = true
             const input = isRecord(value.input) ? value.input : { value: value.input }
             yield* updateToolCall(value.id, (match) => ({
               ...match,
@@ -645,6 +648,12 @@ const layer = Layer.effect(
               metadata: value.providerMetadata,
             })
             ctx.assistantMessage.finish = value.reason
+            const emptyResponse = value.reason === "stop" && !ctx.hasOutput
+            if (emptyResponse) {
+              ctx.assistantMessage.error = new SessionV1.EmptyResponseError({
+                message: "The model completed without producing text or a tool call",
+              }).toObject()
+            }
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
             const stepFinishID = PartID.ascending()
@@ -660,6 +669,9 @@ const layer = Layer.effect(
             })
             rememberAttemptPart(stepFinishID)
             yield* session.updateMessage(ctx.assistantMessage)
+            if (emptyResponse) {
+              yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error: ctx.assistantMessage.error })
+            }
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
@@ -711,6 +723,7 @@ const layer = Layer.effect(
           case "text-delta":
             resetAttemptIfNeeded()
             if (!ctx.currentText) return
+            if (value.text.length > 0) ctx.hasOutput = true
             appendChunkedText(ctx.currentText, value.text)
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
