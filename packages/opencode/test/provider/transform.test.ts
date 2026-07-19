@@ -562,7 +562,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     expect(result.include).toEqual(["reasoning.encrypted_content"])
   })
 
-  test("gpt-5.6 family should use implicit prompt cache options", () => {
+  test("gpt-5.6 family should keep the cache key without unsupported cache options", () => {
     const options = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-fast"].map((id) =>
       ProviderTransform.options({ model: createGpt5Model(id), sessionID, providerOptions: {} }),
     )
@@ -574,13 +574,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
       sessionID,
       sessionID,
     ])
-    expect(options.map((item) => item.promptCacheOptions)).toEqual([
-      { mode: "implicit", ttl: "30m" },
-      { mode: "implicit", ttl: "30m" },
-      { mode: "implicit", ttl: "30m" },
-      { mode: "implicit", ttl: "30m" },
-      { mode: "implicit", ttl: "30m" },
-    ])
+    expect(options.every((item) => item.promptCacheOptions === undefined)).toBe(true)
   })
 
   test("gpt-5.5 should keep old prompt cache behavior", () => {

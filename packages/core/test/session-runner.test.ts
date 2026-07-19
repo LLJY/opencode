@@ -2585,7 +2585,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("adds GPT-5.6 family prompt cache options for OpenAI models", () =>
+  it.effect("keeps GPT-5.6 family cache keys without unsupported cache options", () =>
     Effect.gen(function* () {
       yield* setup
       currentModel = Model.make({ id: "gpt-5.6-luna", provider: "openai", route: OpenAIChat.route })
@@ -2595,10 +2595,8 @@ describe("SessionRunnerLLM", () => {
       requests.length = 0
       yield* session.resume(sessionID)
 
-      expect(requests[0]?.providerOptions?.openai).toMatchObject({
-        promptCacheKey: sessionID,
-        promptCacheOptions: { mode: "implicit", ttl: "30m" },
-      })
+      expect(requests[0]?.providerOptions?.openai?.promptCacheKey).toBe(sessionID)
+      expect(requests[0]?.providerOptions?.openai?.promptCacheOptions).toBeUndefined()
     }),
   )
 
