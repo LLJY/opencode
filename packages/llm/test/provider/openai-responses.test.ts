@@ -573,7 +573,7 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
-  it.effect("enables GPT-5.6 family prompt cache options by default", () =>
+  it.effect("does not enable unsupported GPT-5.6 prompt cache options by default", () =>
     Effect.gen(function* () {
       yield* Effect.forEach(["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-fast"], (id) =>
         Effect.gen(function* () {
@@ -586,7 +586,7 @@ describe("OpenAI Responses route", () => {
           )
 
           expect(prepared.body.prompt_cache_key).toBe("session_123")
-          expect(prepared.body.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" })
+          expect(prepared.body).not.toHaveProperty("prompt_cache_options")
         }),
       )
 
