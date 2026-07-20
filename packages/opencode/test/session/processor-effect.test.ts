@@ -534,7 +534,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
 
-        yield* llm.push(reply().reason("one").reset(), reply().reason("two").stop())
+        yield* llm.push(reply().reason("one").reset(), reply().reason("two").text("done").stop())
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "reason")
@@ -720,7 +720,7 @@ it.live("session.processor effect tests publish retry status updates", () =>
         const events = yield* EventV2Bridge.Service
 
         yield* llm.error(503, { error: "boom" })
-        yield* llm.text("")
+        yield* llm.text("after")
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "retry")
