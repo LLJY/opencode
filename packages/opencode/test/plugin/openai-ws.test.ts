@@ -209,6 +209,43 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "before_first_event",
       autoReplaySafe: true,
+      retryable: true,
+      terminalEvent: "response.failed",
+    })
+  })
+
+  test("treats permanent response.failed errors as non-retryable", async () => {
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: {
+              id: "resp_123",
+              status: "failed",
+              error: { code: "invalid_prompt", message: "The prompt is invalid." },
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    expect((await readTextError(response.text())).message).toContain(
+      "OpenAI response failed (invalid_prompt): The prompt is invalid.",
+    )
+    expect(invalid[0]?.info).toEqual({
+      transport: "websocket",
+      phase: "before_first_event",
+      autoReplaySafe: true,
+      retryable: false,
       terminalEvent: "response.failed",
     })
   })
@@ -247,6 +284,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "before_first_event",
       autoReplaySafe: true,
+      retryable: true,
       terminalEvent: "response.done",
     })
   })
@@ -274,6 +312,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "before_first_event",
       autoReplaySafe: true,
+      retryable: false,
       terminalEvent: "response.done",
     })
   })
@@ -313,6 +352,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "after_first_event",
       autoReplaySafe: false,
+      retryable: true,
       terminalEvent: "response.done",
     })
   })
@@ -355,6 +395,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "before_first_event",
       autoReplaySafe: true,
+      retryable: true,
       terminalEvent: "response.failed",
     })
   })
@@ -452,6 +493,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "after_first_event",
       autoReplaySafe: false,
+      retryable: false,
       terminalEvent: "response.failed",
     })
   })
@@ -477,6 +519,7 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "after_first_event",
       autoReplaySafe: false,
+      retryable: false,
       terminalEvent: "response.failed",
     })
   })
@@ -512,7 +555,79 @@ describe("plugin.openai.ws", () => {
       transport: "websocket",
       phase: "before_first_event",
       autoReplaySafe: true,
+      retryable: true,
     })
+  })
+
+  test("marks transient nonterminal error frames after partial output retryable and replay-aware", async () => {
+    const terminal: Record<string, unknown>[] = []
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
+        socket.send(
+          JSON.stringify({
+            type: "error",
+            error: {
+              code: "rate_limit_exceeded",
+              message: "Rate limit reached",
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onTerminal: (event) => terminal.push(event),
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    const error = await readTextError(response.text())
+    expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+    if (!(error instanceof ProviderError.ResponseStreamError)) throw new Error("Expected ResponseStreamError")
+    expect(error.message).toContain("Rate limit reached")
+    expect(error.info).toEqual({
+      transport: "websocket",
+      phase: "after_first_event",
+      autoReplaySafe: false,
+      retryable: true,
+    })
+    expect(terminal.map((event) => event.type)).toEqual(["error"])
+    expect(invalid).toEqual([error])
+  })
+
+  test("keeps permanent nonterminal error frames as plain failures", async () => {
+    const invalid: ProviderError.ResponseStreamError[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
+        socket.send(
+          JSON.stringify({
+            type: "error",
+            error: {
+              code: "invalid_prompt",
+              message: "The prompt is invalid.",
+            },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error),
+    })
+
+    const error = await readTextError(response.text())
+    expect(error.message).toContain("The prompt is invalid.")
+    expect(error).not.toBeInstanceOf(ProviderError.ResponseStreamError)
+    expect(APICallError.isInstance(error)).toBe(false)
+    expect(invalid).toEqual([])
   })
 
   test("errors the SSE stream when the server closes before a terminal event", async () => {
@@ -960,38 +1075,48 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("fails mid-stream wrapped websocket errors as HTTP-style API errors", async () => {
-    const event = {
-      type: "error",
-      status_code: 429,
-      error: {
-        type: "usage_limit_reached",
-        message: "The usage limit has been reached",
-      },
-      headers: {
-        "x-codex-primary-used-percent": "100.0",
-      },
-    }
-    await using server = await createWebSocketServer((socket) => {
-      socket.once("message", () => {
-        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
-        socket.send(JSON.stringify(event))
+  for (const status of [429, 503]) {
+    test(`fails mid-stream wrapped websocket ${status} errors as replay-aware stream errors`, async () => {
+      const event = {
+        type: "error",
+        status_code: status,
+        error: {
+          type: "server_error",
+          message: "The provider is temporarily unavailable",
+        },
+        headers: {
+          "retry-after": "1",
+        },
+      }
+      await using server = await createWebSocketServer((socket) => {
+        socket.once("message", () => {
+          socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+          socket.send(JSON.stringify(event))
+        })
       })
-    })
-    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
-      url: server.url,
-    })
+      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+        url: server.url,
+      })
 
-    const response = await fetch(server.url, streamRequest())
-    const error = await readTextError(response.text())
+      const response = await fetch(server.url, streamRequest())
+      const error = await readTextError(response.text())
 
-    expect(APICallError.isInstance(error)).toBe(true)
-    if (!APICallError.isInstance(error)) throw new Error("Expected APICallError")
-    expect(error.statusCode).toBe(429)
-    expect(error.responseHeaders).toEqual({ "x-codex-primary-used-percent": "100.0" })
-    expect(error.responseBody).toBe(JSON.stringify(event))
-    fetch.close()
-  })
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+      if (!(error instanceof ProviderError.ResponseStreamError)) throw new Error("Expected ResponseStreamError")
+      expect(error.info).toEqual({
+        transport: "websocket",
+        phase: "after_first_event",
+        autoReplaySafe: false,
+        retryable: true,
+      })
+      expect(APICallError.isInstance(error.cause)).toBe(true)
+      if (!APICallError.isInstance(error.cause)) throw new Error("Expected APICallError cause")
+      expect(error.cause.statusCode).toBe(status)
+      expect(error.cause.responseHeaders).toEqual({ "retry-after": "1" })
+      expect(error.cause.responseBody).toBe(JSON.stringify(event))
+      fetch.close()
+    })
+  }
 
   test("does not fall back to HTTP after a websocket connection limit error", async () => {
     let connections = 0
