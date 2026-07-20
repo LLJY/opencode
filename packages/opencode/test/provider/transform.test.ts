@@ -6,6 +6,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { jsonSchema } from "ai"
+import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
 
 describe("ProviderTransform.options - setCacheKey", () => {
   const sessionID = "test-session-123"
@@ -603,7 +604,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     expect(result.textVerbosity).toBe("low")
   })
 
-  test("Bedrock Mantle continues stored responses with only new messages", async () => {
+  test("Bedrock Mantle stored responses retain max-step and post-response messages", async () => {
     const model = {
       ...createGpt5Model("openai.gpt-5.5"),
       id: "amazon-bedrock/openai.gpt-5.5",
@@ -631,7 +632,19 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
       messages: [
         { role: "user", content: "First turn" },
         { role: "assistant", content: "First reply" },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call_1",
+              toolName: "lookup",
+              output: { type: "text", value: "Tool output" },
+            },
+          ],
+        },
         { role: "user", content: "Follow-up" },
+        { role: "assistant", content: MAX_STEPS_PROMPT },
       ],
       tools: {},
       provider: { id: "amazon-bedrock", options: {} } as any,
@@ -648,7 +661,21 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     const result = await Effect.runPromise(LLMRequestPrep.prepare(input))
 
     expect(result.params.options.previousResponseId).toBe("resp_123")
-    expect(result.messages.at(-1)).toEqual({ role: "user", content: "Follow-up" })
+    expect(result.messages.slice(-3)).toEqual([
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "lookup",
+            output: { type: "text", value: "Tool output" },
+          },
+        ],
+      },
+      { role: "user", content: "Follow-up" },
+      { role: "assistant", content: MAX_STEPS_PROMPT },
+    ])
     expect(result.messages.some((message) => message.role === "system" && message.content.includes("Stay concise"))).toBe(
       true,
     )
@@ -661,6 +688,58 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     expect(stateless.params.options.previousResponseId).toBeUndefined()
     expect(JSON.stringify(stateless.messages)).toContain("First turn")
     expect(JSON.stringify(stateless.messages)).toContain("First reply")
+  })
+
+  test("OpenAI OAuth stored responses send only continuation messages", async () => {
+    const model = {
+      ...createGpt5Model("gpt-5.6"),
+      options: { store: true },
+    }
+    const input = {
+      user: {
+        id: "msg_user-test",
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "test",
+        model: { providerID: "openai", modelID: "gpt-5.6" },
+      } as any,
+      sessionID,
+      model,
+      agent: { name: "test", mode: "primary", options: {}, permission: [] } as any,
+      system: ["Stay concise"],
+      messages: [
+        { role: "user", content: "First turn" },
+        { role: "assistant", content: "First reply" },
+        { role: "user", content: "Follow-up" },
+      ],
+      tools: {},
+      provider: { id: "openai", options: {} } as any,
+      auth: { type: "oauth" } as any,
+      plugin: {
+        trigger: (_name: string, _input: unknown, output: unknown) => Effect.succeed(output),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      } as any,
+      flags: { outputTokenMax: 32_000, client: "test" } as any,
+      isWorkflow: false,
+      previousResponseId: "resp_123",
+    } as any
+    const result = await Effect.runPromise(LLMRequestPrep.prepare(input))
+
+    expect(result.params.options.previousResponseId).toBe("resp_123")
+    expect(result.params.options.instructions).toContain("Stay concise")
+    expect(result.messages).toEqual([{ role: "user", content: "Follow-up" }])
+
+    const stateless = await Effect.runPromise(
+      LLMRequestPrep.prepare({ ...input, model: { ...model, options: { store: false } } }),
+    )
+    expect(stateless.params.options.previousResponseId).toBeUndefined()
+    expect(stateless.messages).toEqual(input.messages)
+
+    const workflow = await Effect.runPromise(LLMRequestPrep.prepare({ ...input, isWorkflow: true }))
+    expect(workflow.params.options.previousResponseId).toBe("resp_123")
+    expect(workflow.messages).toEqual(input.messages)
   })
 
   test("openai-compatible gpt-5 models omit Responses-only reasoningSummary", () => {

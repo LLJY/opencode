@@ -202,6 +202,47 @@ describe("session.retry.retryable", () => {
     })
   })
 
+  test("retries replay-safe transient terminal failures", () => {
+    const request = MessageV2.fromError(
+      new ProviderError.ResponseStreamError("OpenAI response failed (server_error)", {
+        transport: "websocket",
+        phase: "before_first_event",
+        autoReplaySafe: true,
+        retryable: true,
+        terminalEvent: "response.failed",
+      }),
+      { providerID },
+    )
+
+    expect(SessionRetry.retryable(request, retryProvider)).toEqual({
+      message: "OpenAI response failed (server_error)",
+    })
+  })
+
+  test("does not retry replay-safe permanent terminal failures", () => {
+    const request = MessageV2.fromError(
+      new ProviderError.ResponseStreamError("OpenAI response failed (invalid_prompt)", {
+        transport: "websocket",
+        phase: "before_first_event",
+        autoReplaySafe: true,
+        retryable: false,
+        terminalEvent: "response.failed",
+      }),
+      { providerID },
+    )
+
+    expect(SessionV1.APIError.isInstance(request)).toBe(true)
+    expect(SessionRetry.retryable(request, retryProvider)).toBeUndefined()
+    if (SessionV1.APIError.isInstance(request)) {
+      expect(request.data.isRetryable).toBe(false)
+      expect(request.data.metadata).toMatchObject({
+        autoReplaySafe: "true",
+        retryable: "false",
+        terminalEvent: "response.failed",
+      })
+    }
+  })
+
   test("does not retry websocket transport errors after output has started", () => {
     const request = MessageV2.fromError(
       new ProviderError.ResponseStreamError(
