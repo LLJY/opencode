@@ -1,6 +1,6 @@
 import { Schema } from "effect"
-import type { LLMRequest, ReasoningEffort, TextVerbosity as TextVerbosityValue } from "../../schema"
-import { ReasoningEfforts, TextVerbosity } from "../../schema"
+import type { LLMRequest, TextVerbosity as TextVerbosityValue } from "../../schema"
+import { ReasoningEffort, ReasoningEfforts, TextVerbosity } from "../../schema"
 
 export const OpenAIReasoningEfforts = ReasoningEfforts.filter(
   (effort): effort is Exclude<ReasoningEffort, "max"> => effort !== "max",
@@ -36,6 +36,7 @@ const PROMPT_CACHE_MODES = new Set<string>(OpenAIPromptCacheModes)
 const PROMPT_CACHE_TTLS = new Set<string>(OpenAIPromptCacheTTLs)
 
 export const OpenAIReasoningEffort = Schema.Literals(OpenAIReasoningEfforts)
+export const OpenAIResponsesReasoningEffort = ReasoningEffort
 export const OpenAITextVerbosity = TextVerbosity
 export const OpenAIResponseIncludable = Schema.Literals(OpenAIResponseIncludables)
 export const OpenAIServiceTier = Schema.Literals(OpenAIServiceTiers)
@@ -45,7 +46,7 @@ export const OpenAIPromptCacheOptions = Schema.Struct({
 })
 export type OpenAIPromptCacheOptions = Schema.Schema.Type<typeof OpenAIPromptCacheOptions>
 
-const isAnyReasoningEffort = (effort: unknown): effort is ReasoningEffort =>
+export const isResponsesReasoningEffort = (effort: unknown): effort is ReasoningEffort =>
   typeof effort === "string" && REASONING_EFFORTS.has(effort)
 
 export const isReasoningEffort = (effort: unknown): effort is OpenAIReasoningEffort =>
@@ -63,7 +64,7 @@ export const store = (request: LLMRequest): boolean | undefined => {
 
 export const reasoningEffort = (request: LLMRequest): ReasoningEffort | undefined => {
   const value = options(request)?.reasoningEffort
-  return isAnyReasoningEffort(value) ? value : undefined
+  return isResponsesReasoningEffort(value) ? value : undefined
 }
 
 export const reasoningSummary = (request: LLMRequest): "auto" | undefined =>
@@ -83,6 +84,11 @@ export const include = (request: LLMRequest): ReadonlyArray<OpenAIResponseInclud
 
 export const promptCacheKey = (request: LLMRequest) => {
   const value = options(request)?.promptCacheKey
+  return typeof value === "string" ? value : undefined
+}
+
+export const previousResponseId = (request: LLMRequest) => {
+  const value = options(request)?.previousResponseId
   return typeof value === "string" ? value : undefined
 }
 

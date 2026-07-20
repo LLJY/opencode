@@ -127,6 +127,7 @@ const OpenAIResponsesCoreFields = {
   model: Schema.String,
   input: Schema.Array(OpenAIResponsesInputItem),
   instructions: Schema.optional(Schema.String),
+  previous_response_id: Schema.optional(Schema.String),
   tools: optionalArray(OpenAIResponsesTool),
   tool_choice: Schema.optional(OpenAIResponsesToolChoice),
   store: Schema.optional(Schema.Boolean),
@@ -136,7 +137,7 @@ const OpenAIResponsesCoreFields = {
   include: optionalArray(OpenAIOptions.OpenAIResponseIncludable),
   reasoning: Schema.optional(
     Schema.Struct({
-      effort: Schema.optional(OpenAIOptions.OpenAIReasoningEffort),
+      effort: Schema.optional(OpenAIOptions.OpenAIResponsesReasoningEffort),
       summary: Schema.optional(Schema.Literal("auto")),
     }),
   ),
@@ -465,8 +466,9 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
   const store = OpenAIOptions.store(request)
   const promptCacheKey = OpenAIOptions.promptCacheKey(request)
   const promptCacheOptions = OpenAIOptions.promptCacheOptions(request)
+  const previousResponseId = OpenAIOptions.previousResponseId(request)
   const effort = OpenAIOptions.reasoningEffort(request)
-  if (effort && !OpenAIOptions.isReasoningEffort(effort))
+  if (effort && !OpenAIOptions.isResponsesReasoningEffort(effort))
     return yield* invalid(`OpenAI Responses does not support reasoning effort ${effort}`)
   const summary = OpenAIOptions.reasoningSummary(request)
   const include = OpenAIOptions.include(request)
@@ -478,6 +480,7 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
     ...(store !== undefined ? { store } : {}),
     ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
     ...(promptCacheOptions ? { prompt_cache_options: promptCacheOptions } : {}),
+    ...(previousResponseId !== undefined ? { previous_response_id: previousResponseId } : {}),
     ...(include ? { include } : {}),
     ...(effort || summary ? { reasoning: { effort, summary } } : {}),
     ...(verbosity ? { text: { verbosity } } : {}),
@@ -943,26 +946,56 @@ const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): st
 const providerError = (event: OpenAIResponsesEvent, fallback: string, state?: ParserState) => {
   const code = event.code || event.error?.code || event.response?.error?.code || undefined
   const message = providerErrorMessage(event, fallback)
-  const retryable = isStreamIncompleteProviderError(event)
+  const retryable = isTransientProviderError(event)
   const terminalEvent = event.type === "response.failed" || event.type === "response.done" ? event.type : undefined
   return LLMEvent.providerError({
     message,
     classification: code === "context_length_exceeded" || isContextOverflow(message) ? "context-overflow" : undefined,
     ...(retryable ? { retryable: true } : {}),
-    ...(terminalEvent
-      ? { providerMetadata: openaiMetadata({ terminalEvent, autoReplaySafe: !state?.hasModelOutput }) }
+    ...(terminalEvent || (event.type === "error" && retryable)
+      ? {
+          providerMetadata: openaiMetadata({
+            ...(terminalEvent ? { terminalEvent } : {}),
+            autoReplaySafe: !state?.hasModelOutput,
+          }),
+        }
       : {}),
   })
 }
 
-const isStreamIncompleteProviderError = (event: OpenAIResponsesEvent) => {
+const TRANSIENT_PROVIDER_ERROR_CODES = new Set([
+  "stream_incomplete",
+  "server_error",
+  "overload",
+  "overload_error",
+  "overloaded",
+  "overloaded_error",
+  "server_is_overloaded",
+  "server_overloaded",
+  "rate_limit",
+  "rate_limit_error",
+  "rate_limit_exceeded",
+  "rate_limit_reached",
+])
+
+// Retryability describes the provider failure itself; `autoReplaySafe` remains
+// separate because a transient failure can still be unsafe to replay after output.
+const isTransientProviderError = (event: OpenAIResponsesEvent) => {
+  if (event.type === "response.done" && responseDoneStatus(event) !== "failed") return false
   const direct = event.error ?? undefined
   const nested = event.response?.error ?? undefined
   const code = event.code || direct?.code || nested?.code || undefined
   const message = event.message || direct?.message || nested?.message || undefined
-  return [code, message].some(
-    (value) =>
-      typeof value === "string" && (/stream[_ ]incomplete/i.test(value) || /before\s+response\.completed/i.test(value)),
+  if (typeof code === "string" && TRANSIENT_PROVIDER_ERROR_CODES.has(code.toLowerCase())) return true
+  return (
+    typeof message === "string" &&
+    (/stream[_ ]incomplete/i.test(message) ||
+      /before\s+response\.completed/i.test(message) ||
+      /\bserver[_ -]?error\b/i.test(message) ||
+      /\boverload(?:ed|ing)?\b/i.test(message) ||
+      /\brate[_ -]?limits?(?:\b|[_ -])/i.test(message) ||
+      /\btoo many requests\b/i.test(message) ||
+      /\bslow down\b/i.test(message))
   )
 }
 
@@ -979,7 +1012,7 @@ const onResponseDone = (state: ParserState, event: OpenAIResponsesEvent): StepRe
 
 const onError = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
   state,
-  [providerError(event, "OpenAI Responses stream error")],
+  [providerError(event, "OpenAI Responses stream error", state)],
 ]
 
 const step = (state: ParserState, event: OpenAIResponsesEvent) => {
