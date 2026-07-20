@@ -8,6 +8,7 @@ import {
   isContextOverflowFailure,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
+import { OpenAIChat, OpenAIResponses } from "@opencode-ai/llm/protocols"
 import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
@@ -211,11 +212,12 @@ const layer = Layer.effect(
             ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),
           },
         },
-        providerOptions: {
-          openai: {
-            promptCacheKey,
-          },
-        },
+        providerOptions:
+          model.route.id === OpenAIChat.route.id ||
+          model.route.id === OpenAIResponses.route.id ||
+          model.route.id === OpenAIResponses.webSocketRoute.id
+            ? { openai: { promptCacheKey } }
+            : undefined,
         system: [agent.info?.system, system.baseline]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),

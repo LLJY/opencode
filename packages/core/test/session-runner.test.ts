@@ -10,6 +10,7 @@ import {
   type LLMRequest,
 } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
+import { OpenAICompatibleChat } from "@opencode-ai/llm/protocols/openai-compatible-chat"
 import { Database } from "@opencode-ai/core/database/database"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -2582,6 +2583,25 @@ describe("SessionRunnerLLM", () => {
       expect(keys).toEqual([longSessionID.slice(4), otherLongSessionID.slice(4)])
       expect(keys.every((key) => typeof key === "string" && key.length === 64)).toBe(true)
       expect(keys[0]).not.toBe(keys[1])
+    }),
+  )
+
+  it.effect("omits OpenAI prompt cache keys for generic compatible routes", () =>
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = Model.make({
+        id: "compatible-model",
+        provider: "compatible",
+        route: OpenAICompatibleChat.route,
+      })
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run with compatible route" }), resume: false })
+
+      requests.length = 0
+      yield* session.resume(sessionID)
+
+      expect(requests[0]?.model.route.id).toBe(OpenAICompatibleChat.route.id)
+      expect(requests[0]?.providerOptions?.openai?.promptCacheKey).toBeUndefined()
     }),
   )
 

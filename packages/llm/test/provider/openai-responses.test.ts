@@ -69,6 +69,17 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("lowers previous response IDs into HTTP Responses bodies", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.updateRequest(request, { providerOptions: { openai: { previousResponseId: "resp_123" } } }),
+      )
+
+      expect(prepared.body.previous_response_id).toBe("resp_123")
+      expect(prepared.body).not.toHaveProperty("previousResponseId")
+    }),
+  )
+
   it.effect("omits unsupported semantic service tiers", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(
@@ -175,7 +186,7 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
-  it.effect("streams OpenAI Responses over WebSocket", () =>
+  it.effect("lowers previous response IDs when streaming OpenAI Responses over WebSocket", () =>
     Effect.gen(function* () {
       const sent: string[] = []
       const opened: Array<{ readonly url: string; readonly authorization: string | undefined }> = []
@@ -214,6 +225,7 @@ describe("OpenAI Responses route", () => {
             "gpt-4.1-mini",
           ),
           prompt: "Say hello.",
+          providerOptions: { openai: { previousResponseId: "resp_ws_previous" } },
         }),
       ).pipe(Effect.provide(LLMClient.layer.pipe(Layer.provide(deps))))
 
@@ -226,6 +238,7 @@ describe("OpenAI Responses route", () => {
         model: "gpt-4.1-mini",
         input: [{ role: "user", content: [{ type: "input_text", text: "Say hello." }] }],
         store: false,
+        previous_response_id: "resp_ws_previous",
       })
     }),
   )
@@ -570,6 +583,20 @@ describe("OpenAI Responses route", () => {
       expect(prepared.body.include).toEqual(["reasoning.encrypted_content"])
       expect(prepared.body.reasoning).toEqual({ effort: "high", summary: "auto" })
       expect(prepared.body.text).toEqual({ verbosity: "low" })
+    }),
+  )
+
+  it.effect("lowers max reasoning effort for native GPT-5.6 Responses", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.request({
+          model: Model.update(model, { id: "gpt-5.6-sol" }),
+          prompt: "think",
+          providerOptions: { openai: { reasoningEffort: "max" } },
+        }),
+      )
+
+      expect(prepared.body.reasoning).toEqual({ effort: "max" })
     }),
   )
 
@@ -1372,9 +1399,34 @@ describe("OpenAI Responses route", () => {
       // sometimes-generic provider message. The bare message alone meant
       // production errors like rate limits were indistinguishable from
       // unrelated stream failures.
-      expect(response.events).toEqual([{ type: "provider-error", message: "rate_limit_exceeded: Slow down" }])
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "rate_limit_exceeded: Slow down",
+          retryable: true,
+          providerMetadata: { openai: { autoReplaySafe: true } },
+        },
+      ])
     }),
   )
+
+  for (const code of ["rate_limit", "server_is_overloaded"] as const)
+    it.effect(`marks code-only ${code} error events retryable`, () =>
+      Effect.gen(function* () {
+        const response = yield* LLMClient.generate(request).pipe(
+          Effect.provide(fixedResponse(sseEvents({ type: "error", code }))),
+        )
+
+        expect(response.events).toEqual([
+          {
+            type: "provider-error",
+            message: code,
+            retryable: true,
+            providerMetadata: { openai: { autoReplaySafe: true } },
+          },
+        ])
+      }),
+    )
 
   it.effect("marks stream_incomplete error events retryable", () =>
     Effect.gen(function* () {
@@ -1395,6 +1447,7 @@ describe("OpenAI Responses route", () => {
           type: "provider-error",
           message: "stream_incomplete: Upstream websocket closed before response.completed",
           retryable: true,
+          providerMetadata: { openai: { autoReplaySafe: true } },
         },
       ])
     }),
@@ -1421,8 +1474,31 @@ describe("OpenAI Responses route", () => {
           type: "provider-error",
           message: "stream_incomplete: Upstream websocket closed before response.completed",
           retryable: true,
+          providerMetadata: { openai: { autoReplaySafe: true } },
         },
       ])
+    }),
+  )
+
+  it.effect("marks transient error events after output unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              { type: "error", code: "server_error", message: "Upstream model unavailable" },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "server_error: Upstream model unavailable",
+        retryable: true,
+        providerMetadata: { openai: { autoReplaySafe: false } },
+      })
     }),
   )
 
@@ -1517,7 +1593,7 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
-  it.effect("marks retryable unknown response.done after output unsafe for replay", () =>
+  it.effect("does not mark cancelled response.done retryable even when its error is transient", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
         Effect.provide(
@@ -1542,7 +1618,6 @@ describe("OpenAI Responses route", () => {
       expect(response.events.at(-1)).toEqual({
         type: "provider-error",
         message: "stream_incomplete: Upstream websocket closed before response.completed",
-        retryable: true,
         providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
       })
     }),
@@ -1573,6 +1648,7 @@ describe("OpenAI Responses route", () => {
       expect(response.events.at(-1)).toEqual({
         type: "provider-error",
         message: "rate_limit_exceeded: Rate limit reached",
+        retryable: true,
         providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
       })
     }),
@@ -1674,6 +1750,7 @@ describe("OpenAI Responses route", () => {
         {
           type: "provider-error",
           message: "server_error: Upstream model unavailable",
+          retryable: true,
           providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: true } },
         },
       ])
@@ -1684,14 +1761,14 @@ describe("OpenAI Responses route", () => {
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
         Effect.provide(
-          fixedResponse(sseEvents({ type: "response.done", response: { id: "resp_done_unknown", status: "cancelled" } })),
+          fixedResponse(sseEvents({ type: "response.done", response: { id: "resp_done_unknown" } })),
         ),
       )
 
       expect(response.events).toEqual([
         {
           type: "provider-error",
-          message: "OpenAI Responses response ended with status cancelled",
+          message: "OpenAI Responses response ended with status unknown",
           providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: true } },
         },
       ])
@@ -1742,6 +1819,31 @@ describe("OpenAI Responses route", () => {
         {
           type: "provider-error",
           message: "server_error: Upstream model unavailable",
+          retryable: true,
+          providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: true } },
+        },
+      ])
+    }),
+  )
+
+  it.effect("marks overloaded response.failed messages retryable", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "response.failed",
+              response: { error: { message: "The engine is currently overloaded, please try again later" } },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "The engine is currently overloaded, please try again later",
+          retryable: true,
           providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: true } },
         },
       ])
