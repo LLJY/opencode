@@ -19,6 +19,7 @@ export interface ResponseStreamInfo {
   transport: ResponseStreamTransport
   phase: ResponseStreamPhase
   autoReplaySafe: boolean
+  retryable?: boolean
   terminalEvent?: string
 }
 

@@ -726,12 +726,13 @@ export function fromError(
       return new APIError(
         {
           message: e.message,
-          isRetryable: e.info.autoReplaySafe,
+          isRetryable: e.info.retryable ?? (e.info.terminalEvent ? false : e.info.autoReplaySafe),
           metadata: {
             code: e.name,
             transport: e.info.transport,
             phase: e.info.phase,
             autoReplaySafe: String(e.info.autoReplaySafe),
+            ...(e.info.retryable === undefined ? {} : { retryable: String(e.info.retryable) }),
             ...(e.info.terminalEvent ? { terminalEvent: e.info.terminalEvent } : {}),
           },
         },

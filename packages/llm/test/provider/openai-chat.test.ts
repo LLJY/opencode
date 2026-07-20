@@ -115,6 +115,22 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
+  it.effect("rejects max reasoning effort for OpenAI Chat", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.prepare(
+        LLM.request({
+          model: Model.update(model, { id: "gpt-5.6-sol" }),
+          prompt: "think",
+          providerOptions: { openai: { reasoningEffort: "max" } },
+        }),
+      ).pipe(Effect.flip)
+
+      expect(error).toBeInstanceOf(LLMError)
+      expect(error.reason).toMatchObject({ _tag: "InvalidRequest" })
+      expect(error.message).toContain("OpenAI Chat does not support reasoning effort max")
+    }),
+  )
+
   it.effect("does not enable unsupported GPT-5.6 prompt cache options by default", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(

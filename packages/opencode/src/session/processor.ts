@@ -309,6 +309,7 @@ const layer = Layer.effect(
                 autoReplaySafe,
               }),
           ...(typeof openai?.terminalEvent === "string" ? { terminalEvent: openai.terminalEvent } : {}),
+          retryable: value.retryable === true,
         } satisfies ProviderError.ResponseStreamInfo
       }
 
@@ -627,7 +628,11 @@ const layer = Layer.effect(
               throw new SessionV1.ContextOverflowError({ message: value.message }).toObject()
             }
             const streamInfo = providerErrorStreamInfo(value)
-            if (streamInfo.terminalEvent || (value.retryable === true && responseStreamErrorMessage(value.message))) {
+            if (
+              streamInfo.terminalEvent ||
+              (value.retryable === true &&
+                (replayAwareProviderError(value) || responseStreamErrorMessage(value.message)))
+            ) {
               throw new ProviderError.ResponseStreamError(value.message, streamInfo)
             }
             const error = new Error(value.message)
@@ -895,11 +900,11 @@ const layer = Layer.effect(
           }
           const retryable =
             candidate instanceof ProviderError.ResponseStreamError
-              ? { message: candidate.message }
+              ? responseStreamRetryable(candidate)
+                ? { message: candidate.message }
+                : undefined
               : SessionRetry.retryable(parse(candidate), input.model.providerID)
           if (!retryable) return candidate
-
-          if (candidate instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(candidate)) return candidate
 
           if (ctx.blocked) {
             return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
@@ -1039,11 +1044,14 @@ const layer = Layer.effect(
   }),
 )
 
-function unsafeTerminalFailure(error: ProviderError.ResponseStreamError) {
-  return (
-    (error.info.terminalEvent === "response.failed" || error.info.terminalEvent === "response.done") &&
-    !error.info.autoReplaySafe
-  )
+function responseStreamRetryable(error: ProviderError.ResponseStreamError) {
+  if (error.info.retryable !== undefined) return error.info.retryable
+  return error.info.terminalEvent === undefined
+}
+
+function replayAwareProviderError(value: Extract<StreamEvent, { type: "provider-error" }>) {
+  const openai = isRecord(value.providerMetadata?.openai) ? value.providerMetadata.openai : undefined
+  return typeof openai?.autoReplaySafe === "boolean"
 }
 
 const RESPONSE_STREAM_ERROR_PATTERNS = [/stream[_ ]incomplete/i, /before\s+response\.completed/i]
