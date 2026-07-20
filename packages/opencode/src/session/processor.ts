@@ -253,6 +253,7 @@ const layer = Layer.effect(
         ctx.attemptNeedsReset = false
         ctx.currentText = undefined
         ctx.reasoningMap = {}
+        ctx.hasOutput = false
       }
 
       function resetAttemptIfNeeded() {
