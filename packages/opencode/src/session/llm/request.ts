@@ -14,6 +14,7 @@ import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
+import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
 
@@ -102,18 +103,22 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
   if (isOpenaiOauth) options.instructions = system.join("\n")
 
   const previousAssistant = previousResponseId
-    ? input.messages.findLastIndex((message) => message.role === "assistant")
+    ? input.messages.findLastIndex(
+        (message) => message.role === "assistant" && message.content !== MAX_STEPS_PROMPT,
+      )
     : -1
   const messages =
-    isOpenaiOauth || input.isWorkflow
+    input.isWorkflow
       ? input.messages
       : [
-          ...system.map(
-            (x): ModelMessage => ({
-              role: "system",
-              content: x,
-            }),
-          ),
+          ...(isOpenaiOauth
+            ? []
+            : system.map(
+                (x): ModelMessage => ({
+                  role: "system",
+                  content: x,
+                }),
+              )),
           ...input.messages.slice(previousAssistant + 1),
         ]
 
