@@ -1065,6 +1065,146 @@ isolatedIt.live("session.processor effect tests rollback retryable stream_incomp
   ),
 )
 
+isolatedIt.live("session.processor effect tests rollback replay-aware transient plain provider errors", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+            LLMEvent.providerError({
+              message: "server_error: Upstream model unavailable",
+              retryable: true,
+              providerMetadata: { openai: { autoReplaySafe: false } },
+            }),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry replay-aware provider error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry replay-aware provider error" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+            "after",
+          ])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests surface empty response after rolling back retryable output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+            LLMEvent.providerError({
+              message: "server_error: Upstream model unavailable",
+              retryable: true,
+              providerMetadata: { openai: { terminalEvent: "response.failed", autoReplaySafe: false } },
+            }),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry into empty response")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry into empty response" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "text" || part.type === "tool")).toEqual([])
+          expect(SessionV1.EmptyResponseError.isInstance(handle.message.error)).toBe(true)
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
 isolatedIt.live("session.processor effect tests do not replay arbitrary retryable provider-error events", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1305,7 +1445,7 @@ it.live("session.processor effect tests rollback assistant-only partial output b
   ),
 )
 
-isolatedIt.live("session.processor effect tests do not retry unsafe response.done after partial output", () =>
+isolatedIt.live("session.processor effect tests rollback retryable websocket response.done after partial output", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1324,6 +1464,7 @@ isolatedIt.live("session.processor effect tests do not retry unsafe response.don
                     transport: "websocket",
                     phase: "after_first_event",
                     autoReplaySafe: false,
+                    retryable: true,
                     terminalEvent: "response.done",
                   },
                 ),
@@ -1370,16 +1511,13 @@ isolatedIt.live("session.processor effect tests do not retry unsafe response.don
           })
 
           const parts = yield* MessageV2.parts(msg.id)
-          const text = parts.find((part): part is SessionV1.TextPart => part.type === "text")
-
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(text?.text).toBe("partial")
-          expect(SessionV1.APIError.isInstance(handle.message.error)).toBe(true)
-          if (SessionV1.APIError.isInstance(handle.message.error)) {
-            expect(handle.message.error.data.metadata?.terminalEvent).toBe("response.done")
-            expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("false")
-          }
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+            "after",
+          ])
+          expect(handle.message.error).toBeUndefined()
         })
 
         yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
@@ -1388,19 +1526,17 @@ isolatedIt.live("session.processor effect tests do not retry unsafe response.don
   ),
 )
 
-isolatedIt.live("session.processor effect tests preserve terminal metadata for response.done provider-error events", () =>
+isolatedIt.live("session.processor effect tests preserve permanent response.done provider-error metadata", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
         const llm = llmStub()
         llm.push(
           Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.textStart({ id: "text_1" }),
-            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
             LLMEvent.providerError({
               message: "Rate limit reached",
-              providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: false } },
+              retryable: false,
+              providerMetadata: { openai: { terminalEvent: "response.done", autoReplaySafe: true } },
             }),
           ),
           Stream.make(
@@ -1443,16 +1579,17 @@ isolatedIt.live("session.processor effect tests preserve terminal metadata for r
           })
 
           const parts = yield* MessageV2.parts(msg.id)
-          const text = parts.find((part): part is SessionV1.TextPart => part.type === "text")
 
           expect(value).toBe("stop")
           expect(llm.calls).toBe(1)
-          expect(text?.text).toBe("partial")
+          expect(parts.filter((part) => part.type === "text" || part.type === "tool")).toEqual([])
           expect(SessionV1.APIError.isInstance(handle.message.error)).toBe(true)
           if (SessionV1.APIError.isInstance(handle.message.error)) {
             expect(handle.message.error.data.message).toBe("Rate limit reached")
+            expect(handle.message.error.data.isRetryable).toBe(false)
             expect(handle.message.error.data.metadata?.terminalEvent).toBe("response.done")
-            expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("false")
+            expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("true")
+            expect(handle.message.error.data.metadata?.retryable).toBe("false")
           }
         })
 

@@ -91,6 +91,7 @@ export function retryable(error: Err, provider: string) {
   if (SessionV1.APIError.isInstance(error)) {
     const transport = error.data.metadata?.transport
     if (transport === "websocket" || transport === "sse") {
+      if (!error.data.isRetryable) return undefined
       if (error.data.metadata?.autoReplaySafe !== "true") return undefined
       return { message: error.data.message }
     }

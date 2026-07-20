@@ -249,27 +249,32 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
 
     const wrappedError = parseWrappedError(event, text)
     if (wrappedError && event) {
-      if (!emitted) options.onFirstEvent?.(wrappedError)
-      completed = true
-      cleanup()
-      options.onTerminal?.(event)
-      controller?.error(
-        new APICallError({
-          message: wrappedError.message,
-          url: socket.url,
-          requestBodyValues: options.body,
-          statusCode: wrappedError.status,
-          responseHeaders: wrappedError.headers,
-          responseBody: wrappedError.body,
-        }),
+      const error = new APICallError({
+        message: wrappedError.message,
+        url: socket.url,
+        requestBodyValues: options.body,
+        statusCode: wrappedError.status,
+        responseHeaders: wrappedError.headers,
+        responseBody: wrappedError.body,
+      })
+      if (!emitted) {
+        options.onFirstEvent?.(wrappedError)
+        failTerminal(event, error)
+        return
+      }
+      failTerminal(
+        event,
+        retryableHttpStatus(wrappedError.status)
+          ? failure(wrappedError.message, error, { retryable: true })
+          : error,
       )
       return
     }
 
     const normalizedEvent = normalizeTerminalEvent(event)
-    const transportTerminalError = normalizedEvent && terminalTransportError(normalizedEvent, failure)
-    if (transportTerminalError) {
-      failTerminal(normalizedEvent, transportTerminalError)
+    const streamError = normalizedEvent && classifiedStreamError(normalizedEvent, failure)
+    if (streamError) {
+      failTerminal(normalizedEvent, streamError)
       return
     }
 
@@ -476,7 +481,7 @@ function normalizeTerminalEvent(event: Record<string, unknown> | undefined) {
   return event
 }
 
-function terminalTransportError(
+function classifiedStreamError(
   event: Record<string, unknown>,
   failure: (
     message: string,
@@ -484,13 +489,32 @@ function terminalTransportError(
     info?: Partial<ProviderError.ResponseStreamInfo>,
   ) => ProviderError.ResponseStreamError,
 ) {
-  if (event.type === "response.failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
+  if (event.type === "response.failed") {
+    return failure(responseFailedMessage(event), event, {
+      retryable: transientProviderError(event),
+      terminalEvent: event.type,
+    })
+  }
   if (event.type === "response.done") {
     const status = responseStatus(event)
-    if (status === "failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
-    return failure(`OpenAI response ended with status ${status ?? "unknown"}`, event, { terminalEvent: event.type })
+    if (status === "failed") {
+      return failure(responseFailedMessage(event), event, {
+        retryable: transientProviderError(event),
+        terminalEvent: event.type,
+      })
+    }
+    return failure(`OpenAI response ended with status ${status ?? "unknown"}`, event, {
+      retryable: false,
+      terminalEvent: event.type,
+    })
   }
-  if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
+  if (event.type === "error" && (transportErrorEvent(event) || transientProviderError(event))) {
+    return failure(eventErrorMessage(event), event, { retryable: true })
+  }
+}
+
+function retryableHttpStatus(status: number) {
+  return status === 429 || (status >= 500 && status < 600)
 }
 
 function ensureIdleErrorHandler(socket: WebSocket) {
@@ -510,7 +534,7 @@ function responseFailedMessage(event: Record<string, unknown>) {
 }
 
 function responseFailedDetail(event: Record<string, unknown>) {
-  const details = [event.error, isRecord(event.response) ? event.response.error : undefined]
+  const details = [event, event.error, isRecord(event.response) ? event.response.error : undefined]
     .filter(isRecord)
     .map((error) => ({
       code: typeof error.code === "string" && error.code ? error.code : undefined,
@@ -524,6 +548,46 @@ function responseFailedDetail(event: Record<string, unknown>) {
     code: best.code ?? details.find((detail) => detail.code)?.code,
     message: best.message ?? details.find((detail) => detail.message)?.message,
   }
+}
+
+const TRANSIENT_PROVIDER_ERROR_CODES = new Set([
+  "stream_incomplete",
+  "server_error",
+  "overload",
+  "overload_error",
+  "overloaded",
+  "overloaded_error",
+  "server_is_overloaded",
+  "server_overloaded",
+  "rate_limit",
+  "rate_limit_error",
+  "rate_limit_exceeded",
+  "rate_limit_reached",
+])
+
+function transientProviderError(event: Record<string, unknown>) {
+  if (event.type === "response.done" && responseStatus(event) !== "failed") return false
+  const code = providerErrorField(event, "code")
+  const message = providerErrorField(event, "message")
+  if (code && TRANSIENT_PROVIDER_ERROR_CODES.has(code.toLowerCase())) return true
+  return (
+    typeof message === "string" &&
+    (/stream[_ ]incomplete/i.test(message) ||
+      /before\s+response\.completed/i.test(message) ||
+      /\bserver[_ -]?error\b/i.test(message) ||
+      /\boverload(?:ed|ing)?\b/i.test(message) ||
+      /\brate[_ -]?limits?(?:\b|[_ -])/i.test(message) ||
+      /\btoo many requests\b/i.test(message) ||
+      /\bslow down\b/i.test(message))
+  )
+}
+
+function providerErrorField(event: Record<string, unknown>, field: "code" | "message") {
+  return [
+    event[field],
+    isRecord(event.error) ? event.error[field] : undefined,
+    isRecord(event.response) && isRecord(event.response.error) ? event.response.error[field] : undefined,
+  ].find((value): value is string => typeof value === "string" && value.length > 0)
 }
 
 function modelOutputEvent(event: Record<string, unknown>) {
@@ -542,26 +606,14 @@ function modelOutputEvent(event: Record<string, unknown>) {
 }
 
 function eventErrorMessage(event: Record<string, unknown>) {
-  if (!("error" in event)) return "OpenAI websocket stream error"
-  const error = event.error
-  if (!isRecord(error)) return "OpenAI websocket stream error"
-  if (typeof error.message === "string" && error.message) return error.message
-  if (typeof error.code === "string" && error.code) return error.code
-  return "OpenAI websocket stream error"
+  return providerErrorField(event, "message") ?? providerErrorField(event, "code") ?? "OpenAI websocket stream error"
 }
 
 function transportErrorEvent(event: Record<string, unknown>) {
   const message = eventErrorMessage(event)
-  const code = eventErrorCode(event)
+  const code = providerErrorField(event, "code")?.toLowerCase()
   if (code === "stream_incomplete" || code === "websocket_connection_limit_reached") return true
   return /before response\.completed/i.test(message) || /stream[_ ]incomplete/i.test(message)
-}
-
-function eventErrorCode(event: Record<string, unknown>) {
-  if (!("error" in event)) return
-  const error = event.error
-  if (!isRecord(error)) return
-  return typeof error.code === "string" ? error.code : undefined
 }
 
 export * as OpenAIWebSocket from "./ws"
