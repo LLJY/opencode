@@ -846,6 +846,32 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("maps incomplete response reasons", () =>
+    Effect.gen(function* () {
+      const generate = (incompleteDetails: object) =>
+        LLMClient.generate(request).pipe(
+          Effect.provide(
+            fixedResponse(
+              sseEvents({
+                type: "response.incomplete",
+                response: { id: "resp_incomplete", incomplete_details: incompleteDetails },
+              }),
+            ),
+          ),
+        )
+
+      const length = yield* generate({ reason: "max_output_tokens" })
+      const contentFilter = yield* generate({ reason: "content_filter" })
+      const unknown = yield* generate({})
+
+      expect([length.finishReason, contentFilter.finishReason, unknown.finishReason]).toEqual([
+        "length",
+        "content-filter",
+        "unknown",
+      ])
+    }),
+  )
+
   it.effect("preserves encrypted reasoning metadata for continuation", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
