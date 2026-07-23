@@ -155,6 +155,10 @@ export function retryable(error: Err, provider: string) {
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
 
+  // Check for retryable patterns in plain text error messages. The shared
+  // RETRYABLE_MESSAGE_PATTERNS list already covers the flattened provider
+  // overload strings ("our servers are currently overloaded") that used to be
+  // matched by an explicit substring check here.
   const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
   const lower = message.toLowerCase()
