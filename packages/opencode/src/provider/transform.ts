@@ -1165,9 +1165,6 @@ export function options(input: {
 
   if (input.model.api.npm === "@ai-sdk/azure") {
     result["store"] = false
-    if (input.previousResponseId) {
-      result["previousResponseId"] = input.previousResponseId
-    }
   }
 
   if (input.model.api.npm === "@openrouter/ai-sdk-provider" || input.model.api.npm === "@llmgateway/ai-sdk-provider") {
