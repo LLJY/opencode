@@ -34,6 +34,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { McpCatalog } from "./catalog"
 import { McpEvent } from "@opencode-ai/schema/mcp-event"
 import { McpBrowser } from "./browser"
+import { McpRateLimit } from "./rate-limit"
 
 const DEFAULT_TIMEOUT = 30_000
 const CLIENT_OPTIONS = {
@@ -107,7 +108,7 @@ export const Status = Schema.Union([
 export type Status = Schema.Schema.Type<typeof Status>
 
 // Store transports for OAuth servers to allow finishing auth
-type TransportWithAuth = StreamableHTTPClientTransport | SSEClientTransport
+type TransportWithAuth = McpRateLimit.RetryTransport
 const pendingOAuthTransports = new Map<string, { transport: TransportWithAuth; provider?: McpOAuthPendingProvider }>()
 
 // Prompt cache types
@@ -209,7 +210,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const browser = yield* McpBrowser.Service
 
-    type Transport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport
+    type Transport = StdioClientTransport | McpRateLimit.RetryTransport
 
     /**
      * Connect a client via the given transport with resource safety:
@@ -269,17 +270,27 @@ const layer = Layer.effect(
       const transports: Array<{ name: string; transport: TransportWithAuth }> = [
         {
           name: "StreamableHTTP",
-          transport: new StreamableHTTPClientTransport(url, {
-            authProvider,
-            requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
-          }),
+          transport: new McpRateLimit.RetryTransport(
+            url,
+            (fetch) =>
+              new StreamableHTTPClientTransport(url, {
+                authProvider,
+                requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
+                fetch,
+              }),
+          ),
         },
         {
           name: "SSE",
-          transport: new SSEClientTransport(url, {
-            authProvider,
-            requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
-          }),
+          transport: new McpRateLimit.RetryTransport(
+            url,
+            (fetch) =>
+              new SSEClientTransport(url, {
+                authProvider,
+                requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
+                fetch,
+              }),
+          ),
         },
       ]
 
@@ -843,10 +854,15 @@ const layer = Layer.effect(
         auth,
       )
 
-      const transport = new StreamableHTTPClientTransport(url, {
-        authProvider,
-        requestInit: mcpConfig.headers ? { headers: mcpConfig.headers } : undefined,
-      })
+      const transport = new McpRateLimit.RetryTransport(
+        url,
+        (fetch) =>
+          new StreamableHTTPClientTransport(url, {
+            authProvider,
+            requestInit: mcpConfig.headers ? { headers: mcpConfig.headers } : undefined,
+            fetch,
+          }),
+      )
       const directory = yield* InstanceState.directory
 
       return yield* Effect.tryPromise({
