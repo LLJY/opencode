@@ -4,7 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { APICallError, tool } from "ai"
+import { APICallError, JSONParseError, tool } from "ai"
 import { InvalidProviderOutputReason, InvalidRequestReason, LLMError, LLMEvent } from "@opencode-ai/llm"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
@@ -974,6 +974,83 @@ isolatedIt.live("session.processor effect tests treats user-cancelled stream fai
           expect(llm.calls).toBe(1)
           expect(states).toStrictEqual([])
           expect(handle.message.error?.name).toBe("MessageAbortedError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests rollback partial output before malformed stream retry", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new JSONParseError({
+                  text: '{"choices":[{"index":0data: {"id":"abc"}',
+                  cause: new SyntaxError("Expected ','"),
+                }),
+              ),
+            ),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry malformed stream")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry malformed stream" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
+            "after",
+          ])
+          expect(handle.message.error).toBeUndefined()
         })
 
         yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
