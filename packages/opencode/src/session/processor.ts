@@ -26,6 +26,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
+import { JSONParseError } from "ai"
 
 const DOOM_LOOP_THRESHOLD = 3
 const textChunks = new WeakMap<{ text: string }, string[]>()
@@ -285,6 +286,12 @@ const layer = Layer.effect(
         return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)), {
           cause: error,
         })
+      }
+
+      function normalizeJsonParseResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
+        if (!JSONParseError.isInstance(error)) return undefined
+        const message = `Provider returned malformed JSON stream: ${error.message.slice(0, 200)}`
+        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), { cause: error })
       }
 
       function normalizeRetryableProviderStreamError(
@@ -892,7 +899,8 @@ const layer = Layer.effect(
 
       const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
         Effect.gen(function* () {
-          const candidate = normalizeNativeResponseStreamError(error) ?? error
+          const candidate =
+            normalizeNativeResponseStreamError(error) ?? normalizeJsonParseResponseStreamError(error) ?? error
           yield* refreshCancelledByUser()
           if (cancelledByUser && cancelInducedTransportCandidate(candidate)) {
             aborted = true
