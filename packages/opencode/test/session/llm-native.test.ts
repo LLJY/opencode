@@ -332,6 +332,59 @@ describe("session.llm-native.request", () => {
     ])
   })
 
+  it.effect("replays supported OpenAI-compatible reasoning through native request lowering", () =>
+    Effect.gen(function* () {
+      const prepared = yield* prepareNativeRequest({
+        model: {
+          ...baseModel,
+          providerID: ProviderV2.ID.make("opencode"),
+          api: {
+            ...baseModel.api,
+            url: "https://ai.example.test/v1",
+            npm: "@ai-sdk/openai-compatible",
+          },
+          capabilities: { ...baseModel.capabilities, interleaved: { field: "reasoning_content" } },
+        },
+        apiKey: "test-key",
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "answer" }],
+            providerOptions: { openaiCompatible: { reasoning_content: "thinking" } },
+          },
+        ],
+      })
+
+      expect(prepared.body).toMatchObject({
+        messages: [{ role: "assistant", content: "answer", reasoning_content: "thinking" }],
+      })
+    }),
+  )
+
+  test("falls back from native OpenAI-compatible models with unsupported reasoning fields", () => {
+    const provider = {
+      ...providerInfo,
+      id: ProviderV2.ID.make("opencode"),
+      options: { apiKey: "test-key", baseURL: "https://ai.example.test/v1" },
+    }
+    const model = (field: string): Provider.Model => ({
+      ...baseModel,
+      providerID: provider.id,
+      api: { ...baseModel.api, url: "https://ai.example.test/v1", npm: "@ai-sdk/openai-compatible" },
+      capabilities: { ...baseModel.capabilities, interleaved: { field } },
+    })
+
+    expect(LLMNativeRuntime.status({ model: model("reasoning_content"), provider, auth: undefined })).toMatchObject({
+      type: "supported",
+    })
+    for (const field of ["reasoning_text", "vendor_reasoning"]) {
+      expect(LLMNativeRuntime.status({ model: model(field), provider, auth: undefined })).toEqual({
+        type: "unsupported",
+        reason: `native OpenAI-compatible runtime does not support ${field}`,
+      })
+    }
+  })
+
   test("selects native request routes for provider packages", () => {
     const openai = LLMNative.model({
       model: { ...baseModel, api: { ...baseModel.api, url: "", npm: "@ai-sdk/openai" } },
