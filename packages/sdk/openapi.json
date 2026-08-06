@@ -16188,6 +16188,27 @@
         "required": ["name", "data"],
         "additionalProperties": false
       },
+      "EmptyResponseError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["EmptyResponseError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
       "APIError": {
         "type": "object",
         "properties": {
@@ -16283,6 +16304,9 @@
               },
               {
                 "$ref": "#/components/schemas/ContentFilterError"
+              },
+              {
+                "$ref": "#/components/schemas/EmptyResponseError"
               },
               {
                 "$ref": "#/components/schemas/APIError"
@@ -19130,6 +19154,9 @@
                           },
                           {
                             "$ref": "#/components/schemas/ContentFilterError"
+                          },
+                          {
+                            "$ref": "#/components/schemas/EmptyResponseError"
                           },
                           {
                             "$ref": "#/components/schemas/APIError"
@@ -31663,6 +31690,9 @@
                     "$ref": "#/components/schemas/ContentFilterError"
                   },
                   {
+                    "$ref": "#/components/schemas/EmptyResponseError"
+                  },
+                  {
                     "$ref": "#/components/schemas/APIError"
                   }
                 ]
@@ -35542,6 +35572,9 @@
                   },
                   {
                     "$ref": "#/components/schemas/ContentFilterError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EmptyResponseError"
                   },
                   {
                     "$ref": "#/components/schemas/APIError"
