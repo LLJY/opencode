@@ -57,6 +57,11 @@ function statusWithFetch(
   const npm = input.model.api.npm
   if (npm !== "@ai-sdk/openai" && npm !== "@ai-sdk/openai-compatible" && npm !== "@ai-sdk/anthropic")
     return { type: "unsupported", reason: "provider package is not OpenAI, OpenAI-compatible, or Anthropic" }
+  const interleavedField =
+    typeof input.model.capabilities.interleaved === "object" ? input.model.capabilities.interleaved.field : undefined
+  if (npm === "@ai-sdk/openai-compatible" && interleavedField && interleavedField !== "reasoning_content") {
+    return { type: "unsupported", reason: `native OpenAI-compatible runtime does not support ${interleavedField}` }
+  }
   if (input.auth?.type === "oauth" && !(input.provider.id === "openai" && fetch)) {
     return { type: "unsupported", reason: "OAuth auth requires a provider fetch override" }
   }
