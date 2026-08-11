@@ -35,6 +35,7 @@ import { McpCatalog } from "./catalog"
 import { McpEvent } from "@opencode-ai/schema/mcp-event"
 import { McpBrowser } from "./browser"
 import { McpRateLimit } from "./rate-limit"
+import { McpConfig } from "./config"
 
 const DEFAULT_TIMEOUT = 30_000
 const CLIENT_OPTIONS = {
@@ -123,10 +124,6 @@ function isMcpConfigured(entry: McpEntry): entry is ConfigMCPV1.Info {
 
 function remoteURL(value: string) {
   if (URL.canParse(value)) return new URL(value)
-}
-
-function hasAuthorizationHeader(headers: Record<string, string> | undefined) {
-  return Object.keys(headers ?? {}).some((key) => key.toLowerCase() === "authorization")
 }
 
 interface CreateResult {
@@ -242,7 +239,7 @@ const layer = Layer.effect(
       key: string,
       mcp: ConfigMCPV1.Info & { type: "remote" },
     ) {
-      const oauthDisabled = mcp.oauth === false || hasAuthorizationHeader(mcp.headers)
+      const oauthDisabled = McpConfig.oauthDisabled(mcp)
       const oauthConfig = typeof mcp.oauth === "object" ? mcp.oauth : undefined
       const url = remoteURL(mcp.url)
       if (!url) {
@@ -821,8 +818,8 @@ const layer = Layer.effect(
     const startAuth = Effect.fn("MCP.startAuth")(function* (mcpName: string) {
       const mcpConfig = yield* requireMcpConfig(mcpName)
       if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
-      if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
-      if (hasAuthorizationHeader(mcpConfig.headers)) {
+      if (McpConfig.oauthDisabled(mcpConfig)) {
+        if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
         throw new Error(`MCP server ${mcpName} uses an explicit Authorization header; OAuth is disabled`)
       }
       const url = remoteURL(mcpConfig.url)
@@ -938,8 +935,25 @@ const layer = Layer.effect(
       return yield* finishAuth(mcpName, code)
     })
 
+    const invalidatePendingAuth = Effect.fnUntraced(function* (mcpName: string) {
+      const pending = pendingOAuthTransports.get(mcpName)
+      pendingOAuthTransports.delete(mcpName)
+      McpOAuthCallback.cancelPending(mcpName)
+      yield* auth.clearOAuthState(mcpName)
+      yield* auth.clearCodeVerifier(mcpName)
+      if (pending) yield* Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
+    })
+
     const finishAuth = Effect.fn("MCP.finishAuth")(function* (mcpName: string, authorizationCode: string) {
-      yield* requireMcpConfig(mcpName)
+      const mcpConfig = yield* requireMcpConfig(mcpName)
+      if (mcpConfig.type !== "remote") {
+        yield* invalidatePendingAuth(mcpName)
+        throw new Error(`MCP server ${mcpName} is not a remote server`)
+      }
+      if (McpConfig.oauthDisabled(mcpConfig)) {
+        yield* invalidatePendingAuth(mcpName)
+        throw new Error(`OAuth is disabled by configuration for MCP server ${mcpName}`)
+      }
       const pending = pendingOAuthTransports.get(mcpName)
       if (!pending) throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
 
@@ -959,8 +973,6 @@ const layer = Layer.effect(
       yield* auth.clearCodeVerifier(mcpName)
       pendingOAuthTransports.delete(mcpName)
 
-      const mcpConfig = yield* requireMcpConfig(mcpName)
-
       return yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
     })
 
@@ -972,7 +984,7 @@ const layer = Layer.effect(
 
     const supportsOAuth = Effect.fn("MCP.supportsOAuth")(function* (mcpName: string) {
       const mcpConfig = yield* requireMcpConfig(mcpName)
-      return mcpConfig.type === "remote" && mcpConfig.oauth !== false
+      return mcpConfig.type === "remote" && !McpConfig.oauthDisabled(mcpConfig)
     })
 
     const hasStoredTokens = Effect.fn("MCP.hasStoredTokens")(function* (mcpName: string) {

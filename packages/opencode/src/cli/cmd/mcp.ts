@@ -20,6 +20,7 @@ import { Global } from "@opencode-ai/core/global"
 import { modify, applyEdits } from "jsonc-parser"
 import { Filesystem } from "@/util/filesystem"
 import { Effect } from "effect"
+import { McpConfig } from "../../mcp/config"
 
 function getAuthStatusIcon(status: MCP.AuthStatus): string {
   switch (status) {
@@ -61,7 +62,7 @@ function configuredServers(config: ConfigV1.Info) {
 
 function oauthServers(config: ConfigV1.Info) {
   return configuredServers(config).filter(
-    (entry): entry is [string, McpRemote] => isMcpRemote(entry[1]) && entry[1].oauth !== false,
+    (entry): entry is [string, McpRemote] => isMcpRemote(entry[1]) && !McpConfig.oauthDisabled(entry[1]),
   )
 }
 
@@ -125,7 +126,7 @@ export const McpListCommand = effectCmd({
 
     for (const [name, serverConfig] of servers) {
       const status = statuses[name]
-      const hasOAuth = isMcpRemote(serverConfig) && !!serverConfig.oauth
+      const hasOAuth = isMcpRemote(serverConfig) && !!serverConfig.oauth && !McpConfig.oauthDisabled(serverConfig)
       const hasStoredTokens = stored[name]
 
       let statusIcon: string
@@ -231,7 +232,7 @@ export const McpAuthCommand = effectCmd({
       return
     }
 
-    if (!isMcpRemote(serverConfig) || serverConfig.oauth === false) {
+    if (!isMcpRemote(serverConfig) || McpConfig.oauthDisabled(serverConfig)) {
       prompts.log.error(`MCP server ${serverName} is not an OAuth-capable remote server`)
       prompts.outro("Done")
       return
@@ -667,14 +668,19 @@ export const McpDebugCommand = effectCmd({
     }),
   handler: Effect.fn("Cli.mcp.debug")(function* (args) {
     const config = yield* Config.Service.use((cfg) => cfg.get())
-    const mcp = yield* MCP.Service
-    const auth = yield* McpAuth.Service
     const serverConfig = config.mcp?.[args.name]
     const authInfo =
-      serverConfig && isMcpRemote(serverConfig) && serverConfig.oauth !== false
-        ? yield* Effect.all({
-            authStatus: mcp.getAuthStatus(args.name),
-            entry: auth.get(args.name),
+      serverConfig && isMcpRemote(serverConfig) && !McpConfig.oauthDisabled(serverConfig)
+        ? yield* Effect.gen(function* () {
+            const mcp = yield* MCP.Service
+            const auth = yield* McpAuth.Service
+            return {
+              ...(yield* Effect.all({
+                authStatus: mcp.getAuthStatus(args.name),
+                entry: auth.get(args.name),
+              })),
+              auth,
+            }
           })
         : undefined
     yield* Effect.promise(async () => {
@@ -695,35 +701,34 @@ export const McpDebugCommand = effectCmd({
         return
       }
 
-      if (serverConfig.oauth === false) {
-        prompts.log.warn(`MCP server ${serverName} has OAuth explicitly disabled`)
-        prompts.outro("Done")
-        return
-      }
-
       prompts.log.info(`Server: ${serverName}`)
       prompts.log.info(`URL: ${serverConfig.url}`)
 
-      const { authStatus, entry } = authInfo!
-      prompts.log.info(`Auth status: ${getAuthStatusIcon(authStatus)} ${getAuthStatusText(authStatus)}`)
+      if (!authInfo) prompts.log.warn(`MCP server ${serverName} has OAuth disabled by configuration`)
 
-      if (entry?.tokens) {
+      if (authInfo) {
         prompts.log.info(
-          `  Access token: ${entry.tokens.accessToken.length > 8 ? `${entry.tokens.accessToken.slice(0, 4)}***${entry.tokens.accessToken.slice(-4)}` : "***"}`,
+          `Auth status: ${getAuthStatusIcon(authInfo.authStatus)} ${getAuthStatusText(authInfo.authStatus)}`,
         )
-        if (entry.tokens.expiresAt) {
-          const expiresDate = new Date(entry.tokens.expiresAt * 1000)
-          const isExpired = entry.tokens.expiresAt < Date.now() / 1000
+      }
+
+      if (authInfo?.entry?.tokens) {
+        prompts.log.info(
+          `  Access token: ${authInfo.entry.tokens.accessToken.length > 8 ? `${authInfo.entry.tokens.accessToken.slice(0, 4)}***${authInfo.entry.tokens.accessToken.slice(-4)}` : "***"}`,
+        )
+        if (authInfo.entry.tokens.expiresAt) {
+          const expiresDate = new Date(authInfo.entry.tokens.expiresAt * 1000)
+          const isExpired = authInfo.entry.tokens.expiresAt < Date.now() / 1000
           prompts.log.info(`  Expires: ${expiresDate.toISOString()} ${isExpired ? "(EXPIRED)" : ""}`)
         }
-        if (entry.tokens.refreshToken) {
+        if (authInfo.entry.tokens.refreshToken) {
           prompts.log.info(`  Refresh token: present`)
         }
       }
-      if (entry?.clientInfo) {
-        prompts.log.info(`  Client ID: ${entry.clientInfo.clientId}`)
-        if (entry.clientInfo.clientSecretExpiresAt) {
-          const expiresDate = new Date(entry.clientInfo.clientSecretExpiresAt * 1000)
+      if (authInfo?.entry?.clientInfo) {
+        prompts.log.info(`  Client ID: ${authInfo.entry.clientInfo.clientId}`)
+        if (authInfo.entry.clientInfo.clientSecretExpiresAt) {
+          const expiresDate = new Date(authInfo.entry.clientInfo.clientSecretExpiresAt * 1000)
           prompts.log.info(`  Client secret expires: ${expiresDate.toISOString()}`)
         }
       }
@@ -760,7 +765,12 @@ export const McpDebugCommand = effectCmd({
           prompts.log.info(`WWW-Authenticate: ${wwwAuth}`)
         }
 
-        if (response.status === 401) {
+        if (response.status === 401 && !authInfo) {
+          prompts.log.warn(
+            "Connection returned 401 while OAuth is disabled; check the configured authentication headers",
+          )
+        } else if (response.status === 401) {
+          if (!authInfo) throw new Error("OAuth debug state is unavailable")
           prompts.log.info("Initial unauthenticated check returned 401, so this server requires OAuth")
 
           // Try to discover OAuth metadata
@@ -777,7 +787,7 @@ export const McpDebugCommand = effectCmd({
             {
               onRedirect: async () => {},
             },
-            auth,
+            authInfo.auth,
           )
 
           prompts.log.info("Testing OAuth flow (without completing authorization)...")
