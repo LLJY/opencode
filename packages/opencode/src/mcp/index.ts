@@ -125,6 +125,10 @@ function remoteURL(value: string) {
   if (URL.canParse(value)) return new URL(value)
 }
 
+function hasAuthorizationHeader(headers: Record<string, string> | undefined) {
+  return Object.keys(headers ?? {}).some((key) => key.toLowerCase() === "authorization")
+}
+
 interface CreateResult {
   mcpClient?: MCPClient
   status: Status
@@ -238,7 +242,7 @@ const layer = Layer.effect(
       key: string,
       mcp: ConfigMCPV1.Info & { type: "remote" },
     ) {
-      const oauthDisabled = mcp.oauth === false
+      const oauthDisabled = mcp.oauth === false || hasAuthorizationHeader(mcp.headers)
       const oauthConfig = typeof mcp.oauth === "object" ? mcp.oauth : undefined
       const url = remoteURL(mcp.url)
       if (!url) {
@@ -818,6 +822,9 @@ const layer = Layer.effect(
       const mcpConfig = yield* requireMcpConfig(mcpName)
       if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
       if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
+      if (hasAuthorizationHeader(mcpConfig.headers)) {
+        throw new Error(`MCP server ${mcpName} uses an explicit Authorization header; OAuth is disabled`)
+      }
       const url = remoteURL(mcpConfig.url)
       if (!url) throw new Error(`Invalid MCP URL for "${mcpName}"`)
 
