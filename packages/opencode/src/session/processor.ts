@@ -80,8 +80,8 @@ class StopAfterDeterministicAssistantError extends Error {
   public override readonly name = "SessionProcessorStopAfterDeterministicAssistantError"
 }
 
-class StopAfterUnsafeToolActivity extends Error {
-  public override readonly name = "SessionProcessorStopAfterUnsafeToolActivity"
+class StopAfterObservedSideEffect extends Error {
+  public override readonly name = "SessionProcessorStopAfterObservedSideEffect"
 }
 
 class StopAfterRollbackFailure extends Error {
@@ -141,6 +141,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   requestHasCommittedToolBoundary: boolean
   attemptHasToolActivity: boolean
+  attemptHasTextCompleteEffect: boolean
   attemptCommitted: boolean
   attemptHasSnapshotPatch: boolean
   attemptNeedsReset: boolean
@@ -187,6 +188,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         requestHasCommittedToolBoundary: false,
         attemptHasToolActivity: false,
+        attemptHasTextCompleteEffect: false,
         attemptCommitted: false,
         attemptHasSnapshotPatch: false,
         attemptNeedsReset: false,
@@ -244,6 +246,7 @@ const layer = Layer.effect(
 
       function resetReplayGuardState() {
         ctx.attemptHasToolActivity = false
+        ctx.attemptHasTextCompleteEffect = false
         ctx.attemptCommitted = false
         ctx.attemptHasSnapshotPatch = false
         ctx.attemptPartIDs = []
@@ -770,6 +773,9 @@ const layer = Layer.effect(
             if (!ctx.currentText) return
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
+            ctx.attemptHasTextCompleteEffect = (yield* plugin.list()).some(
+              (hook) => hook["experimental.text.complete"] !== undefined,
+            )
             ctx.currentText.text = (yield* plugin.trigger(
               "experimental.text.complete",
               {
@@ -861,7 +867,7 @@ const layer = Layer.effect(
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
         })
-        const source = e instanceof StopAfterUnsafeToolActivity ? (e.cause ?? e) : e
+        const source = e instanceof StopAfterObservedSideEffect ? (e.cause ?? e) : e
         const error = parse(source)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
@@ -933,8 +939,17 @@ const layer = Layer.effect(
             return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
           }
 
-          if (ctx.attemptHasToolActivity) {
-            return new StopAfterUnsafeToolActivity(retryable.message, { cause: candidate })
+          // Provider replay metadata cannot make locally observed effects safe
+          // to execute again.
+          if (ctx.attemptHasTextCompleteEffect || ctx.attemptHasToolActivity || ctx.attemptHasSnapshotPatch) {
+            return new StopAfterObservedSideEffect(retryable.message, { cause: candidate })
+          }
+
+          if (
+            ctx.attemptCommitted &&
+            (ctx.assistantMessage.finish === "content-filter" || ctx.assistantMessage.finish === "error")
+          ) {
+            return new StopAfterDeterministicAssistantError(retryable.message, { cause: candidate })
           }
 
           if (ctx.requestHasCommittedToolBoundary) {
@@ -950,7 +965,6 @@ const layer = Layer.effect(
           // Only a normally stopped assistant-only step is safe to regenerate.
           // Deterministic finishes such as content-filter/error remain terminal.
           if (ctx.attemptCommitted && ctx.assistantMessage.finish !== "stop") return candidate
-          if (ctx.attemptHasSnapshotPatch) return candidate
           if (ctx.attemptPartIDs.length === 0) return candidate
 
           yield* rollbackCurrentAttempt()
@@ -978,7 +992,6 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
-
         return yield* Effect.gen(function* () {
           const outcome = yield* Effect.gen(function* () {
             resetAttemptState()
@@ -1025,7 +1038,7 @@ const layer = Layer.effect(
               () => Effect.succeed("stop" as const),
             ),
             Effect.catchIf(
-              (error) => error instanceof StopAfterUnsafeToolActivity,
+              (error) => error instanceof StopAfterObservedSideEffect,
               (error) => halt(error.cause ?? error).pipe(Effect.as("stop" as const)),
             ),
             Effect.catchIf(
@@ -1053,6 +1066,7 @@ const layer = Layer.effect(
           )
 
           if (outcome === "resume") return "resume"
+          if (outcome === "stop") return "stop"
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
