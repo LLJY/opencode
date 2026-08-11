@@ -6,6 +6,7 @@ const INITIAL_DELAY = 1_000
 const MAX_DELAY = 30_000
 const MAX_TIMER_DELAY = 2_147_483_647
 const ACTIVE_POLL_INTERVAL = 25
+const MAX_UNSCOPED_RETRIES = 3
 
 type RemoteTransport = Transport & {
   finishAuth: (authorizationCode: string) => Promise<void>
@@ -50,7 +51,10 @@ export class RetryTransport implements Transport {
     this.random = options.random ?? Math.random
     this.wait = options.wait ?? wait
     this.transport = make((url, init) => this.retry(url, init))
-    this.transport.onclose = () => this.onclose?.()
+    this.transport.onclose = () => {
+      this.controller.abort()
+      this.onclose?.()
+    }
     this.transport.onerror = (error) => this.onerror?.(error)
     this.transport.onmessage = (message, extra) => this.onmessage?.(message, extra)
   }
@@ -109,6 +113,7 @@ export class RetryTransport implements Transport {
       ensureActive(signals, active)
       const response = await this.fetchImpl(url, init)
       if (response.status !== 429) return response
+      if (!active && attempt >= MAX_UNSCOPED_RETRIES) return response
 
       const duration = delay(response.headers, attempt, { now: this.now(), random: this.random() })
       void response.body?.cancel().catch(() => {})

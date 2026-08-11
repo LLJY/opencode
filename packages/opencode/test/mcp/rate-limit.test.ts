@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import {
@@ -139,6 +140,51 @@ describe("McpRateLimit.RetryTransport", () => {
     await expect(send).rejects.toBeDefined()
   })
 
+  test("inner transport close interrupts pending retry backoff", async () => {
+    const entered = Promise.withResolvers<void>()
+    const closed = Promise.withResolvers<() => void>()
+    const endpoint = new URL("https://mcp.example.test")
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (retry) => ({
+        start: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        finishAuth: () => Promise.resolve(),
+        send: (message) => retry(endpoint, { method: "POST", body: JSON.stringify(message) }).then(() => {}),
+        set onclose(value: (() => void) | undefined) {
+          if (value) closed.resolve(value)
+        },
+      }),
+      {
+        fetch: () => Promise.resolve(new Response(null, { status: 429, headers: { "retry-after": "30" } })),
+        wait: (_delay, signals) => {
+          entered.resolve()
+          return new Promise((resolve, reject) => {
+            const signal = AbortSignal.any([...signals])
+            const abort = () => reject(signal.reason)
+            signal.addEventListener("abort", abort, { once: true })
+            if (signal.aborted) abort()
+          })
+        },
+      },
+    )
+    const send = transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
+    await entered.promise
+
+    const close = await closed.promise
+    close()
+
+    const result = await Promise.race([
+      send.then(
+        () => ({ status: "resolved" as const }),
+        (error) => ({ status: "rejected" as const, error }),
+      ),
+      Bun.sleep(25).then(() => ({ status: "pending" as const })),
+    ])
+    await transport.close()
+    expect(result).toMatchObject({ status: "rejected", error: { name: "AbortError" } })
+  })
+
   test("forwards optional Streamable HTTP session APIs", async () => {
     const resumed: string[] = []
     let terminated = 0
@@ -174,6 +220,102 @@ describe("McpRateLimit.RetryTransport", () => {
     expect(terminated).toBe(1)
   })
 
+  test("bounds always-429 Streamable HTTP SSE resumption GET", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    const methods: string[] = []
+    const eventIds: Array<string | null> = []
+    const cancelled: number[] = []
+    const errors: Error[] = []
+    let attempts = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      {
+        fetch: (_url, init) => {
+          const attempt = ++attempts
+          methods.push(init?.method ?? "GET")
+          eventIds.push(new Headers(init?.headers).get("last-event-id"))
+          return Promise.resolve(
+            new Response(
+              new ReadableStream({
+                cancel() {
+                  cancelled.push(attempt)
+                },
+              }),
+              {
+                status: 429,
+                statusText: "Too Many Requests",
+                headers: { "x-ratelimit-reset-after": "0.001" },
+              },
+            ),
+          )
+        },
+      },
+    )
+    transport.onerror = (error) => errors.push(error)
+    await transport.start()
+
+    try {
+      await expect(transport.resumeStream("event-42")).rejects.toMatchObject({ code: 429 })
+      expect(attempts).toBe(4)
+      expect(methods).toEqual(["GET", "GET", "GET", "GET"])
+      expect(eventIds).toEqual(["event-42", "event-42", "event-42", "event-42"])
+      expect(cancelled).toEqual([1, 2, 3, 4])
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toMatchObject({ code: 429 })
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("bounds always-429 background Streamable HTTP SSE GET", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    const failed = Promise.withResolvers<Error>()
+    const cancelled: number[] = []
+    let gets = 0
+    let posts = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      {
+        fetch: (_url, init) => {
+          if (init?.method === "POST") {
+            posts++
+            return Promise.resolve(new Response(null, { status: 202 }))
+          }
+
+          const attempt = ++gets
+          return Promise.resolve(
+            new Response(
+              new ReadableStream({
+                cancel() {
+                  cancelled.push(attempt)
+                },
+              }),
+              {
+                status: 429,
+                statusText: "Too Many Requests",
+                headers: { "x-ratelimit-reset-after": "0.001" },
+              },
+            ),
+          )
+        },
+      },
+    )
+    transport.onerror = failed.resolve
+    await transport.start()
+
+    try {
+      await transport.send({ jsonrpc: "2.0", method: "notifications/initialized" })
+      await expect(failed.promise).resolves.toMatchObject({ code: 429 })
+      expect(posts).toBe(1)
+      expect(gets).toBe(4)
+      expect(cancelled).toEqual([1, 2, 3, 4])
+    } finally {
+      await transport.close()
+    }
+  })
+
   test("retries cancellation notifications and session termination after explicit 429", async () => {
     const attempts = new Map<string, number>()
     const endpoint = new URL("https://mcp.example.test")
@@ -206,6 +348,53 @@ describe("McpRateLimit.RetryTransport", () => {
         ["delete", 2],
       ]),
     )
+  })
+
+  test("returns the fourth notification 429 for the SDK to report", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    const overrun = new Error("notification exceeded its retry budget")
+    let attempts = 0
+    let cancelled = 0
+    let waits = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      {
+        fetch: () => {
+          attempts++
+          return Promise.resolve(
+            new Response(
+              new ReadableStream({
+                pull(controller) {
+                  controller.enqueue(new TextEncoder().encode("rate limited"))
+                  controller.close()
+                },
+                cancel() {
+                  cancelled++
+                },
+              }),
+              { status: 429 },
+            ),
+          )
+        },
+        wait: () => {
+          waits++
+          return waits === 4 ? Promise.reject(overrun) : Promise.resolve()
+        },
+      },
+    )
+    await transport.start()
+
+    try {
+      await expect(
+        transport.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } }),
+      ).rejects.toMatchObject({ code: 429 })
+      expect(attempts).toBe(4)
+      expect(waits).toBe(3)
+      expect(cancelled).toBe(3)
+    } finally {
+      await transport.close()
+    }
   })
 
   test("does not replay an ambiguous fetch failure", async () => {
