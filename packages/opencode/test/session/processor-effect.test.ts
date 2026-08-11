@@ -8,6 +8,7 @@ import { APICallError, JSONParseError, tool } from "ai"
 import { InvalidProviderOutputReason, InvalidRequestReason, LLMError, LLMEvent } from "@opencode-ai/llm"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
+import { pathToFileURL } from "url"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
 import { ProviderError } from "../../src/provider/error"
@@ -191,6 +192,44 @@ const env = LayerNode.compile(
   replacements,
 )
 
+function postToolRecoveryLLMLayer() {
+  let calls = 0
+  return Layer.effect(
+    LLM.Service,
+    Effect.gen(function* () {
+      const live = yield* LLM.Service
+      return LLM.Service.of({
+        stream: (input) => {
+          calls += 1
+          const stream = live.stream(input)
+          if (calls !== 1) return stream
+          return stream.pipe(
+            Stream.drain,
+            Stream.concat(
+              Stream.fail(
+                new ProviderError.ResponseStreamError(
+                  "stream_incomplete: Upstream closed before response.completed after graceful tool failure",
+                  {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: true,
+                    retryable: true,
+                  },
+                ),
+              ),
+            ),
+          )
+        },
+      })
+    }),
+  ).pipe(Layer.provide(LayerNode.compile(LLM.node)))
+}
+
+const postToolRecoveryEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [...replacements, [LLM.node, postToolRecoveryLLMLayer()]],
+)
+
 function processorLayer(
   llmLayer: Layer.Layer<LLM.Service>,
   sessionLayer?: Layer.Layer<Session.Service>,
@@ -222,6 +261,7 @@ function rollbackFailureSessionLayer() {
 }
 
 const it = testEffect(env)
+const postToolRecoveryIt = testEffect(postToolRecoveryEnv)
 const isolatedIt = testEffect(LayerNode.compile(CrossSpawnSpawner.node))
 
 const providerErrorLLM = Layer.succeed(
@@ -1768,6 +1808,112 @@ isolatedIt.live("session.processor effect tests rollback a completed assistant-o
   ),
 )
 
+isolatedIt.live("session.processor effect tests do not replay a completed text plugin effect", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const marker = path.join(dir, "text-complete-effects.txt")
+        const pluginFile = path.join(dir, "text-complete-plugin.ts")
+        yield* Effect.promise(() => Bun.write(marker, ""))
+        yield* Effect.promise(() =>
+          Bun.write(
+            pluginFile,
+            [
+              "export default async () => ({",
+              '  "experimental.text.complete": async () => {',
+              `    await Bun.write(${JSON.stringify(marker)}, (await Bun.file(${JSON.stringify(marker)}).text()) + "complete\\n")`,
+              "  },",
+              "})",
+              "",
+            ].join("\n"),
+          ),
+        )
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(dir, "opencode.json"),
+            JSON.stringify({
+              $schema: "https://opencode.ai/config.json",
+              ...cfg,
+              plugin: [pathToFileURL(pluginFile).href],
+            }),
+          ),
+        )
+
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "completed answer" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new ProviderError.ResponseStreamError("server_error: failed after the completed plugin effect", {
+                  transport: "websocket",
+                  phase: "before_first_event",
+                  autoReplaySafe: true,
+                  retryable: true,
+                  terminalEvent: "response.failed",
+                }),
+              ),
+            ),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not replay completed plugin effects")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not replay completed plugin effects" }],
+            tools: {},
+          })
+
+          const effects = yield* Effect.promise(() => Bun.file(marker).text())
+
+          expect(effects).toBe("complete\n")
+          expect(llm.calls).toBe(1)
+          expect(value).toBe("stop")
+          expect(handle.message.error).toBeDefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
 isolatedIt.live("session.processor effect tests do not retry a completed step with a deterministic empty-response error", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1919,7 +2065,167 @@ for (const reason of ["content-filter", "error"] as const) {
   )
 }
 
-isolatedIt.live("session.processor effect tests keep a completed step terminal when it captured a filesystem patch", () =>
+isolatedIt.live("session.processor effect tests keep content-filter terminal after a settled tool", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+            LLMEvent.toolResult({
+              id: "call_1",
+              name: "lookup",
+              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+            }),
+            LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+            LLMEvent.stepStart({ index: 1 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "filtered answer" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 1, reason: "content-filter" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new ProviderError.ResponseStreamError("server_error: response failed after content filter", {
+                  transport: "websocket",
+                  phase: "after_first_event",
+                  autoReplaySafe: false,
+                  retryable: true,
+                  terminalEvent: "response.failed",
+                }),
+              ),
+            ),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "keep content filter terminal after tool")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "keep content filter terminal after tool" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(handle.message.finish).toBe("content-filter")
+          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
+          expect(parts.some((part) => part.type === "text" && part.text === "filtered answer")).toBe(true)
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests keep error finish terminal after a settled tool", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+            LLMEvent.toolResult({
+              id: "call_1",
+              name: "lookup",
+              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+            }),
+            LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+            LLMEvent.stepStart({ index: 1 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "error answer" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 1, reason: "error" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new ProviderError.ResponseStreamError("stream_incomplete: response.done failed after error finish", {
+                  transport: "websocket",
+                  phase: "after_first_event",
+                  autoReplaySafe: false,
+                  retryable: true,
+                  terminalEvent: "response.done",
+                }),
+              ),
+            ),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "keep error finish terminal after tool")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "keep error finish terminal after tool" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(handle.message.finish).toBe("error")
+          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
+          expect(parts.some((part) => part.type === "text" && part.text === "error answer")).toBe(true)
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests let a filesystem patch override provider replay-safe metadata", () =>
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
@@ -1948,7 +2254,7 @@ isolatedIt.live("session.processor effect tests keep a completed step terminal w
                 new ProviderError.ResponseStreamError("server_error: response failed after the patched step", {
                   transport: "websocket",
                   phase: "after_first_event",
-                  autoReplaySafe: false,
+                  autoReplaySafe: true,
                   retryable: true,
                   terminalEvent: "response.failed",
                 }),
@@ -3392,6 +3698,83 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.metadata).toEqual({ source: "test" })
         expect(call.state.time.start).toBeDefined()
         expect(call.state.time.end).toBeDefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+postToolRecoveryIt.live("session.processor effect tests retry a graceful tool failure hidden by stream incomplete", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        let executions = 0
+        const receivers: unknown[] = []
+
+        yield* llm.push(
+          reply().tool("lookup", { query: "weather" }),
+          reply().tool("lookup", { query: "weather" }),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "recover after one real tool execution")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const lookup = tool({
+          description: "Look up information",
+          inputSchema: z.object({ query: z.string() }),
+          async execute(input) {
+            executions += 1
+            receivers.push(this)
+            if (executions === 1) throw new Error("graceful lookup failure")
+            return {
+              title: "Weather lookup",
+              output: `result:${input.query}`,
+              metadata: { source: "test" },
+            }
+          },
+        })
+        Object.freeze(lookup)
+        const executeDescriptor = Object.getOwnPropertyDescriptor(lookup, "execute")
+        const prototype = Object.getPrototypeOf(lookup)
+        const tools = { lookup }
+        const input = {
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "recover after one real tool execution" }],
+          tools,
+        } satisfies LLM.StreamInput
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process(input)
+        const toolParts = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(executions).toBe(2)
+        expect(receivers).toEqual([lookup, lookup])
+        expect(yield* llm.calls).toBe(2)
+        expect(value).toBe("continue")
+        expect(toolParts).toHaveLength(1)
+        expect(toolParts[0]?.state.status).toBe("completed")
+        expect(handle.message.error).toBeUndefined()
+        expect(Object.getOwnPropertyDescriptor(lookup, "execute")).toEqual(executeDescriptor)
+        expect(Object.getPrototypeOf(lookup)).toBe(prototype)
+        expect(Object.isFrozen(lookup)).toBe(true)
       }),
     { config: (url) => providerCfg(url) },
   ),
