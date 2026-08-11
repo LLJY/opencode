@@ -149,6 +149,21 @@ describe("plugin.codex", () => {
     await enabled.dispose?.()
   })
 
+  test("clears max output tokens for the openai provider only", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+
+    // Codex cli sends no max_output_tokens, so the cap is dropped for the real provider.
+    const openai = { maxOutputTokens: 32_000, temperature: 0.2 }
+    await hooks["chat.params"]!({ model: { providerID: "openai" } } as never, openai as never)
+    expect(openai.maxOutputTokens).toBeUndefined()
+    expect(openai.temperature).toBe(0.2)
+
+    const other = { maxOutputTokens: 32_000, temperature: 0.2 }
+    await hooks["chat.params"]!({ model: { providerID: "openai-http-test" } } as never, other as never)
+    expect(other.maxOutputTokens).toBe(32_000)
+    expect(other.temperature).toBe(0.2)
+  })
+
   test("filters unsupported modes and uses Codex context limits for OAuth GPT models", async () => {
     const hooks = await CodexAuthPlugin({} as never)
     const limit = { context: 1_050_000, input: 922_000, output: 128_000 }
