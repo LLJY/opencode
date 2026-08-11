@@ -37,12 +37,21 @@ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <te
 
 ## Relevant Files
 - [file or directory path: why it matters, or "(none)"]
+
+## Workflow Status
+[Include this section only if an active workplan is currently being planned or executed. Otherwise, omit this section entirely.]
+- Mode: [workflow-plan | workflow-execute]
+- Workplan path: [exact path]
+- Current step: [exact current step and status]
+- Plan-checker ran: [yes | no]
+- Continuation requirement: [workflow-plan: "Load the workflow-plan skill before continuing." | workflow-execute: "Load the workflow-execute skill before continuing."]
 </template>
 
 Rules:
-- Keep every section, even when empty.
+- Keep every non-conditional section, even when empty.
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+- Do not infer an active workflow from an old, completed, cancelled, proposed, or merely discussed workplan.
 - Do not mention the summary process or that context was compacted.`
 
 type Entry = {
