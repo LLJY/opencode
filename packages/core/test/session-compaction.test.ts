@@ -13,6 +13,10 @@ test("compaction prompt preserves detailed work state and relevant files", () =>
   expect(prompt).toContain("### Active")
   expect(prompt).toContain("### Blocked")
   expect(prompt).toContain("## Relevant Files")
+  expect(prompt).toContain("## Workflow Status")
+  expect(prompt.indexOf("## Workflow Status")).toBeGreaterThan(prompt.indexOf("## Relevant Files"))
+  expect(prompt).toContain("Load the workflow-execute skill before continuing.")
+  expect(prompt).toContain("Do not infer an active workflow")
 })
 
 test("compaction prompt gives update instructions for a prior summary", () => {
