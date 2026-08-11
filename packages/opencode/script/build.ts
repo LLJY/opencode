@@ -20,6 +20,12 @@ const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
+const targetArgs = process.argv.filter((arg) => arg.startsWith("--target"))
+if (targetArgs.length > 1) throw new Error("Build target may be specified only once")
+const targetArg = targetArgs[0]
+if (targetArg && !targetArg.startsWith("--target=")) throw new Error(`Invalid build target argument: ${targetArg}`)
+const targetFlag = targetArg?.slice("--target=".length)
+if (targetArg && !targetFlag) throw new Error("Build target must not be empty")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
 
@@ -113,26 +119,41 @@ const allTargets: {
   },
 ]
 
-const targets = singleFlag
-  ? allTargets.filter((item) => {
-      if (item.os !== process.platform || item.arch !== process.arch) {
-        return false
-      }
+const targetName = (item: (typeof allTargets)[number]) =>
+  [
+    pkg.name,
+    item.os === "win32" ? "windows" : item.os,
+    item.arch,
+    item.avx2 === false ? "baseline" : undefined,
+    item.abi === undefined ? undefined : item.abi,
+  ]
+    .filter(Boolean)
+    .join("-")
 
-      // When building for the current platform, prefer a single native binary by default.
-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
-      if (item.avx2 === false) {
-        return baselineFlag
-      }
+const targets = (() => {
+  if (targetFlag) return allTargets.filter((item) => targetName(item).slice(`${pkg.name}-`.length) === targetFlag)
+  if (!singleFlag) return allTargets
+  return allTargets.filter((item) => {
+    if (item.os !== process.platform || item.arch !== process.arch) {
+      return false
+    }
 
-      // also skip abi-specific builds for the same reason
-      if (item.abi !== undefined) {
-        return false
-      }
+    // When building for the current platform, prefer a single native binary by default.
+    // Baseline binaries require additional Bun artifacts and can be flaky to download.
+    if (item.avx2 === false) {
+      return baselineFlag
+    }
 
-      return true
-    })
-  : allTargets
+    // also skip abi-specific builds for the same reason
+    if (item.abi !== undefined) {
+      return false
+    }
+
+    return true
+  })
+})()
+
+if (targets.length === 0) throw new Error(`Unknown or unavailable build target: ${targetFlag ?? "native"}`)
 
 await $`rm -rf dist`
 
@@ -143,16 +164,7 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
 }
 for (const item of targets) {
-  const name = [
-    pkg.name,
-    // changing to win32 flags npm for some reason
-    item.os === "win32" ? "windows" : item.os,
-    item.arch,
-    item.avx2 === false ? "baseline" : undefined,
-    item.abi === undefined ? undefined : item.abi,
-  ]
-    .filter(Boolean)
-    .join("-")
+  const name = targetName(item)
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
 
