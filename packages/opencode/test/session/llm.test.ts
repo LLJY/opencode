@@ -21,6 +21,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { OpenAIWebSocketPool } from "@/plugin/openai/ws-pool"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -30,12 +31,17 @@ import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
-const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: string): Partial<ConfigV1.Info> => {
+const openAIConfig = (
+  model: ModelsDev.Provider["models"][string],
+  baseURL: string,
+  providerID = "openai",
+  headers?: Record<string, string>,
+): Partial<ConfigV1.Info> => {
   const { experimental: _experimental, ...configModel } = model
   return {
-    enabled_providers: ["openai"],
+    enabled_providers: [providerID],
     provider: {
-      openai: {
+      [providerID]: {
         name: "OpenAI",
         env: ["OPENAI_API_KEY"],
         npm: "@ai-sdk/openai",
@@ -46,6 +52,7 @@ const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: stri
         options: {
           apiKey: "test-openai-key",
           baseURL,
+          ...(headers && { headers }),
         },
       },
     },
@@ -1179,6 +1186,10 @@ describe("session.llm.stream", () => {
     },
   )
 
+  // Isolated from the real "openai" id so the built-in codex plugin does not swap in its
+  // websocket fetch, which the HTTP-only test server cannot upgrade.
+  const openAIHttpProviderID = ProviderV2.ID.make("openai-http-test")
+
   it.instance(
     "sends responses API payload for OpenAI models",
     () =>
@@ -1229,7 +1240,7 @@ describe("session.llm.stream", () => {
         ]
         const request = waitRequest("/responses", createEventResponse(responseChunks, true))
 
-        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const resolved = yield* Provider.use.getModel(openAIHttpProviderID, ModelV2.ID.make(model.id))
         const sessionID = SessionID.make("session-test-2")
         const agent = {
           name: "test",
@@ -1245,7 +1256,7 @@ describe("session.llm.stream", () => {
           role: "user",
           time: { created: Date.now() },
           agent: agent.name,
-          model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id, variant: "high" },
+          model: { providerID: openAIHttpProviderID, modelID: resolved.id, variant: "high" },
         } satisfies SessionV1.User
 
         yield* drain({
@@ -1267,10 +1278,15 @@ describe("session.llm.stream", () => {
         expect((body.reasoning as { effort?: string } | undefined)?.effort).toBe("high")
         expect((body.reasoning as { mode?: string } | undefined)?.mode).toBe("pro")
 
+        // The codex plugin's `chat.params` hook drops max_output_tokens only for the real
+        // "openai" provider id, so this isolated provider keeps the standard output cap.
         const maxTokens = body.max_output_tokens as number | undefined
-        expect(maxTokens).toBe(undefined) // match codex cli behavior
+        expect(maxTokens).toBe(LLM.OUTPUT_TOKEN_MAX)
       }),
-    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+    {
+      config: () =>
+        openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, openAIHttpProviderID),
+    },
   )
 
   it.instance(
@@ -1371,7 +1387,16 @@ describe("session.llm.stream", () => {
         expect(capture.url.pathname.endsWith("/responses")).toBe(true)
         expect(capture.body.model).toBe(resolved.api.id)
       }),
-    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+    {
+      // Keeps the literal "openai" id, because a natively supported provider is exactly what the
+      // runtime gate keys on. The codex plugin swaps in its websocket fetch for that id, so this
+      // header flips the plugin's own HTTP-fallback switch and keeps the transport on the test
+      // server without touching the provider identity under test.
+      config: () =>
+        openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, "openai", {
+          [OpenAIWebSocketPool.TITLE_HEADER]: "true",
+        }),
+    },
   )
 
   it.instance(
@@ -1701,7 +1726,7 @@ describe("session.llm.stream", () => {
           ),
         ).toString("base64")}`
 
-        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const resolved = yield* Provider.use.getModel(openAIHttpProviderID, ModelV2.ID.make(model.id))
         const sessionID = SessionID.make("session-test-data-url")
         const agent = {
           name: "test",
@@ -1716,7 +1741,7 @@ describe("session.llm.stream", () => {
           role: "user",
           time: { created: Date.now() },
           agent: agent.name,
-          model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+          model: { providerID: openAIHttpProviderID, modelID: resolved.id },
         } satisfies SessionV1.User
 
         yield* drain({
@@ -1740,7 +1765,10 @@ describe("session.llm.stream", () => {
         const capture = yield* Effect.promise(() => request)
         expect(capture.url.pathname.endsWith("/responses")).toBe(true)
       }),
-    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+    {
+      config: () =>
+        openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, openAIHttpProviderID),
+    },
   )
 
   const minimaxFixture = { providerID: "minimax", modelID: "MiniMax-M2.5" }
