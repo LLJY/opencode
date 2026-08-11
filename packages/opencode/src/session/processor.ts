@@ -76,6 +76,10 @@ class StopAfterBlockedToolBoundary extends Error {
   public override readonly name = "SessionProcessorStopAfterBlockedToolBoundary"
 }
 
+class StopAfterDeterministicAssistantError extends Error {
+  public override readonly name = "SessionProcessorStopAfterDeterministicAssistantError"
+}
+
 class StopAfterUnsafeToolActivity extends Error {
   public override readonly name = "SessionProcessorStopAfterUnsafeToolActivity"
 }
@@ -138,6 +142,7 @@ interface ProcessorContext extends Input {
   requestHasCommittedToolBoundary: boolean
   attemptHasToolActivity: boolean
   attemptCommitted: boolean
+  attemptHasSnapshotPatch: boolean
   attemptNeedsReset: boolean
   attemptPartIDs: PartID[]
   currentText: SessionV1.TextPart | undefined
@@ -183,6 +188,7 @@ const layer = Layer.effect(
         requestHasCommittedToolBoundary: false,
         attemptHasToolActivity: false,
         attemptCommitted: false,
+        attemptHasSnapshotPatch: false,
         attemptNeedsReset: false,
         attemptPartIDs: [],
         currentText: undefined,
@@ -239,6 +245,7 @@ const layer = Layer.effect(
       function resetReplayGuardState() {
         ctx.attemptHasToolActivity = false
         ctx.attemptCommitted = false
+        ctx.attemptHasSnapshotPatch = false
         ctx.attemptPartIDs = []
         replayState = captureReplayState()
       }
@@ -527,6 +534,7 @@ const layer = Layer.effect(
             return
 
           case "tool-input-delta":
+            ctx.attemptHasToolActivity = true
             yield* ensureToolCall(value)
             return
 
@@ -697,6 +705,7 @@ const layer = Layer.effect(
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
+                ctx.attemptHasSnapshotPatch = true
                 const patchPartID = PartID.ascending()
                 yield* session.updatePart({
                   id: patchPartID,
@@ -914,6 +923,12 @@ const layer = Layer.effect(
               : SessionRetry.retryable(parse(candidate), input.model.providerID)
           if (!retryable) return candidate
 
+          // Deterministic assistant errors (for example EmptyResponseError) are
+          // already persisted and published; replay cannot safely retract them.
+          if (ctx.assistantMessage.error) {
+            return new StopAfterDeterministicAssistantError(retryable.message, { cause: candidate })
+          }
+
           if (ctx.blocked) {
             return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
           }
@@ -929,7 +944,13 @@ const layer = Layer.effect(
 
           if (!(candidate instanceof ProviderError.ResponseStreamError)) return candidate
           if (candidate.info.autoReplaySafe) return candidate
-          if (ctx.attemptCommitted) return candidate
+          // A completed assistant-only step is still local model output and can
+          // be rolled back as one failed attempt. A captured filesystem patch is
+          // an external effect that removing session parts cannot undo.
+          // Only a normally stopped assistant-only step is safe to regenerate.
+          // Deterministic finishes such as content-filter/error remain terminal.
+          if (ctx.attemptCommitted && ctx.assistantMessage.finish !== "stop") return candidate
+          if (ctx.attemptHasSnapshotPatch) return candidate
           if (ctx.attemptPartIDs.length === 0) return candidate
 
           yield* rollbackCurrentAttempt()
@@ -943,12 +964,9 @@ const layer = Layer.effect(
             Effect.gen(function* () {
               const rollbackError = Cause.squash(cause)
               yield* Effect.logWarning("rollback retryable stream error failed", { error: errorMessage(rollbackError) })
-              if (ctx.requestHasCommittedToolBoundary) {
-                return new StopAfterRollbackFailure(errorMessage(rollbackError), {
-                  cause: rollbackError,
-                })
-              }
-              return error
+              return new StopAfterRollbackFailure(errorMessage(rollbackError), {
+                cause: rollbackError,
+              })
             }),
           ),
         )
@@ -1000,6 +1018,10 @@ const layer = Layer.effect(
             ),
             Effect.catchIf(
               (error) => error instanceof StopAfterBlockedToolBoundary,
+              () => Effect.succeed("stop" as const),
+            ),
+            Effect.catchIf(
+              (error) => error instanceof StopAfterDeterministicAssistantError,
               () => Effect.succeed("stop" as const),
             ),
             Effect.catchIf(
