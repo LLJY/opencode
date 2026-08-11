@@ -85,6 +85,24 @@ describe("mcp.headers", () => {
     }),
   )
 
+  it.instance("configured Authorization disables OAuth capability regardless of casing", () =>
+    Effect.gen(function* () {
+      const mcp = yield* MCP.Service
+
+      for (const [index, header] of ["Authorization", "authorization", "aUtHoRiZaTiOn"].entries()) {
+        const name = `static-auth-capability-${index}`
+        yield* mcp.add(name, {
+          type: "remote",
+          url: "https://example.com/mcp",
+          enabled: false,
+          headers: { [header]: "Bearer static" },
+        })
+
+        expect(yield* mcp.supportsOAuth(name)).toBe(false)
+      }
+    }),
+  )
+
   it.instance("headers are passed to transports when oauth is enabled (default)", () =>
     Effect.gen(function* () {
       const server = yield* serve

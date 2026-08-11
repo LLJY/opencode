@@ -5,7 +5,7 @@ import { ListResourcesRequestSchema, ListToolsRequestSchema } from "@modelcontex
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { Config } from "../../src/config/config"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { McpAuth } from "../../src/mcp/auth"
@@ -37,6 +37,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
         enableJsonResponse: true,
       })
       let listToolsCalls = 0
+      let tokenCalls = 0
       let requiresAuth = true
 
       if (capabilities === "tools") {
@@ -91,6 +92,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
             return Response.json({ ...metadata, client_id: "replacement-client" }, { status: 201 })
           }
           if (url.pathname === "/token") {
+            tokenCalls++
             const body = new URLSearchParams(await request.text())
             if (body.get("code") !== "valid-code") {
               return Response.json(
@@ -121,6 +123,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
           requiresAuth = false
         },
         listToolsCalls: () => listToolsCalls,
+        tokenCalls: () => tokenCalls,
         close: async () => {
           await http.stop(true)
           await protocol.close()
@@ -245,6 +248,52 @@ mcpTest.instance("successful reauthentication commits replacement credentials", 
     expect(entry?.tokens?.accessToken).toBe("replacement-token")
     expect(entry?.clientInfo?.clientId).toBe("replacement-client")
     expect(entry?.serverUrl).toBe(server.url)
+  }),
+)
+
+mcpTest.instance("finishAuth refuses a stale pending flow after static Authorization is configured", () =>
+  Effect.gen(function* () {
+    yield* stopOAuthCallback
+    const server = yield* serveOAuthMcp()
+    const mcp = yield* MCP.Service
+    const auth = yield* McpAuth.Service
+    const name = "test-stale-static-auth"
+
+    yield* auth.updateClientInfo(name, { clientId: "old-client" }, server.url)
+    yield* auth.updateTokens(name, { accessToken: "old-token" }, server.url)
+    yield* mcp.add(name, remote(server.url))
+    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
+
+    yield* mcp.add(name, {
+      type: "remote",
+      url: server.url,
+      enabled: false,
+      headers: { aUtHoRiZaTiOn: "Bearer static" },
+    })
+
+    const exit = yield* mcp.finishAuth(name, "valid-code").pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) throw new Error("expected static Authorization to invalidate the pending OAuth flow")
+    const error = Cause.squash(exit.cause)
+    expect(error).toBeInstanceOf(Error)
+    if (error instanceof Error) expect(error.message).toContain("OAuth is disabled")
+
+    expect(server.tokenCalls()).toBe(0)
+    expect(yield* auth.get(name)).toMatchObject({
+      tokens: { accessToken: "old-token" },
+      clientInfo: { clientId: "old-client" },
+    })
+    expect((yield* auth.get(name))?.oauthState).toBeUndefined()
+    expect((yield* auth.get(name))?.codeVerifier).toBeUndefined()
+
+    yield* mcp.add(name, remote(server.url, false))
+    const retry = yield* mcp.finishAuth(name, "valid-code").pipe(Effect.exit)
+    expect(Exit.isFailure(retry)).toBe(true)
+    if (Exit.isSuccess(retry)) throw new Error("expected the stale pending OAuth flow to be removed")
+    const retryError = Cause.squash(retry.cause)
+    expect(retryError).toBeInstanceOf(Error)
+    if (retryError instanceof Error) expect(retryError.message).toContain("No pending OAuth flow")
+    expect(server.tokenCalls()).toBe(0)
   }),
 )
 
