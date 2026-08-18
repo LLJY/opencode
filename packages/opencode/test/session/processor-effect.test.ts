@@ -1170,6 +1170,802 @@ isolatedIt.live("session.processor effect tests do not replay malformed streams 
   ),
 )
 
+function streamTimeout() {
+  return new Error(
+    JSON.stringify({
+      type: "error",
+      sequence_number: 0,
+      code: "request_timeout",
+      message: "stream error: stream disconnected before completion",
+    }),
+  )
+}
+
+// A provider claiming replay safety only knows what it sent, not what we persisted.
+function replaySafeClaim() {
+  return new ProviderError.ResponseStreamError("stream_incomplete: upstream closed", {
+    transport: "sse",
+    phase: "before_first_event",
+    autoReplaySafe: true,
+    retryable: true,
+  })
+}
+
+isolatedIt.live("session.processor effect tests rollback partial rows despite an autoReplaySafe claim", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(Stream.concat(Stream.fail(replaySafeClaim()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "autoReplaySafe partial rows")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "autoReplaySafe partial rows" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests reject an autoReplaySafe claim after a truncated step", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "truncated" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "length" }),
+          ).pipe(Stream.concat(Stream.fail(replaySafeClaim()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "autoReplaySafe truncated step")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "autoReplaySafe truncated step" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["truncated"])
+          expect(handle.message.error?.name).toBe("APIError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+// Retryable but carries no replay metadata, so recovery must classify it against
+// the current attempt state instead of replaying over persisted rows.
+function streamServerError() {
+  return new Error(
+    JSON.stringify({
+      type: "error",
+      error: { code: "server_error", message: "Upstream model unavailable" },
+    }),
+  )
+}
+
+isolatedIt.live("session.processor effect tests replay plain server errors before any output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.fail(streamServerError()),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "after" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "replay server error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "replay server error" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests rollback assistant-only output before plain server error retry", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(Stream.concat(Stream.fail(streamServerError()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "rollback server error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "rollback server error" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests do not replay plain server errors after tool activity", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolInputStart({ id: "call_1", name: "lookup" }),
+            LLMEvent.toolInputDelta({ id: "call_1", name: "lookup", text: '{"query":' }),
+          ).pipe(Stream.concat(Stream.fail(streamServerError()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not replay tool server error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not replay tool server error" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(parts.some((part) => part.type === "text" && part.text === "must not run")).toBe(false)
+          expect(handle.message.error?.name).toBe("APIError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests do not replay plain server errors after a truncated step", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "truncated" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "length" }),
+          ).pipe(Stream.concat(Stream.fail(streamServerError()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not replay truncated server error")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not replay truncated server error" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["truncated"])
+          expect(handle.message.error?.name).toBe("APIError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests replay top-level stream timeouts before any output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.fail(streamTimeout()),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "after" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "replay stream timeout")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "replay stream timeout" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests rollback assistant-only output before stream timeout retry", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(Stream.concat(Stream.fail(streamTimeout()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "after" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "rollback stream timeout")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "rollback stream timeout" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(llm.calls).toBe(2)
+          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
+          expect(handle.message.error).toBeUndefined()
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests do not replay stream timeouts after tool activity", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.toolInputStart({ id: "call_1", name: "lookup" }),
+            LLMEvent.toolInputDelta({ id: "call_1", name: "lookup", text: '{"query":' }),
+          ).pipe(Stream.concat(Stream.fail(streamTimeout()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not replay tool stream timeout")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not replay tool stream timeout" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(parts.some((part) => part.type === "text" && part.text === "must not run")).toBe(false)
+          expect(handle.message.error?.name).toBe("APIError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests do not replay stream timeouts after a truncated committed step", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "truncated" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "length" }),
+          ).pipe(Stream.concat(Stream.fail(streamTimeout()))),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "do not replay truncated stream timeout")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "do not replay truncated stream timeout" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          // A committed step that did not finish normally is not safe to regenerate,
+          // and its output is already persisted, so the turn stops instead of replaying.
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["truncated"])
+          expect(handle.message.error?.name).toBe("APIError")
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
+isolatedIt.live("session.processor effect tests keep the HTTP path for a request_timeout body on an APICallError", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "truncated" }),
+            LLMEvent.textEnd({ id: "text_1" }),
+            LLMEvent.stepFinish({ index: 0, reason: "length" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new APICallError({
+                  // A gateway that returns the stream error body as the HTTP failure
+                  // message is what makes this ambiguous with a transport timeout.
+                  message: JSON.stringify({
+                    type: "error",
+                    code: "request_timeout",
+                    message: "stream error: stream disconnected before completion",
+                  }),
+                  url: "https://example.com/v1/responses",
+                  requestBodyValues: {},
+                  statusCode: 500,
+                  responseHeaders: { "retry-after": "1" },
+                  responseBody: JSON.stringify({
+                    type: "error",
+                    code: "request_timeout",
+                    message: "stream error: stream disconnected before completion",
+                  }),
+                  isRetryable: true,
+                }),
+              ),
+            ),
+          ),
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.textStart({ id: "text_2" }),
+            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+            LLMEvent.textEnd({ id: "text_2" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+            LLMEvent.finish({ reason: "stop" }),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "http request timeout body")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "http request timeout body" }],
+            tools: {},
+          })
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          // Normalizing this into a transport stream error would drop the status code
+          // and the retry-after header that the HTTP path exists to preserve.
+          expect(SessionV1.APIError.isInstance(handle.message.error)).toBe(true)
+          if (SessionV1.APIError.isInstance(handle.message.error)) {
+            expect(handle.message.error.data.statusCode).toBe(500)
+            expect(handle.message.error.data.responseHeaders?.["retry-after"]).toBe("1")
+            expect(handle.message.error.data.metadata?.transport).toBeUndefined()
+          }
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+      }),
+    { config: cfg },
+  ),
+)
+
 isolatedIt.live("session.processor effect tests rollback retryable stream_incomplete provider-error events", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -3703,7 +4499,11 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
   ),
 )
 
-postToolRecoveryIt.live("session.processor effect tests retry a graceful tool failure hidden by stream incomplete", () =>
+// The stream reports an ambiguous failure after the tool already ran, and drops the
+// events that would have recorded it. Replaying the turn would call the handler a
+// second time on top of whatever the first call already did, so the only safe answer
+// is to stop with the original error until a tool can declare that it is repeatable.
+postToolRecoveryIt.live("session.processor effect tests stop after a tool failure hidden by stream incomplete", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
@@ -3765,13 +4565,15 @@ postToolRecoveryIt.live("session.processor effect tests retry a graceful tool fa
           (part): part is SessionV1.ToolPart => part.type === "tool",
         )
 
-        expect(executions).toBe(2)
-        expect(receivers).toEqual([lookup, lookup])
-        expect(yield* llm.calls).toBe(2)
-        expect(value).toBe("continue")
-        expect(toolParts).toHaveLength(1)
-        expect(toolParts[0]?.state.status).toBe("completed")
-        expect(handle.message.error).toBeUndefined()
+        expect(executions).toBe(1)
+        expect(receivers).toEqual([lookup])
+        expect(yield* llm.calls).toBe(1)
+        expect(value).toBe("stop")
+        expect(toolParts).toHaveLength(0)
+        expect(handle.message.error).toMatchObject({
+          name: "APIError",
+          data: { message: expect.stringContaining("stream_incomplete") },
+        })
         expect(Object.getOwnPropertyDescriptor(lookup, "execute")).toEqual(executeDescriptor)
         expect(Object.getPrototypeOf(lookup)).toBe(prototype)
         expect(Object.isFrozen(lookup)).toBe(true)

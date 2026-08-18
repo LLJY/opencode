@@ -59,6 +59,89 @@ describe("McpRateLimit.delay", () => {
     expect(McpRateLimit.delay(new Headers(), 10, { now, random: 0 })).toBe(15_000)
     expect(McpRateLimit.delay(new Headers(), 10, { now, random: 1 })).toBe(30_000)
   })
+
+  test.each([".2050", "+.2050", "-.2050", "1.5", "2.0"])(
+    "rejects numeric-looking malformed Retry-After value %s",
+    (value) => {
+      expect(McpRateLimit.delay(new Headers({ "retry-after": value }), 0, { now, random: 0 })).toBe(500)
+    },
+  )
+
+  // A parseable header is authoritative even when it asks for no wait, so it must not
+  // hand control to a header the server ranked lower.
+  test("a Retry-After of zero preempts reset headers", () => {
+    expect(
+      McpRateLimit.delay(new Headers({ "retry-after": "0", "ratelimit-reset": "9" }), 0, { now, random: 0 }),
+    ).toBe(500)
+    expect(
+      McpRateLimit.delay(new Headers({ "retry-after": "0", "x-ratelimit-reset-after": "9" }), 1, { now, random: 0 }),
+    ).toBe(1_000)
+  })
+
+  test("an elapsed Retry-After HTTP-date preempts reset headers", () => {
+    expect(
+      McpRateLimit.delay(
+        new Headers({ "retry-after": new Date(now - 4_000).toUTCString(), "ratelimit-reset": "9" }),
+        0,
+        { now, random: 0 },
+      ),
+    ).toBe(500)
+  })
+
+  test("a zero reset header preempts the lower-priority reset headers behind it", () => {
+    expect(
+      McpRateLimit.delay(new Headers({ "ratelimit-reset": "0", "x-ratelimit-reset-after": "9" }), 0, {
+        now,
+        random: 0,
+      }),
+    ).toBe(500)
+    expect(
+      McpRateLimit.delay(
+        new Headers({ "x-ratelimit-reset-after": "0", "x-ratelimit-reset": String(now / 1_000 + 9) }),
+        1,
+        { now, random: 0 },
+      ),
+    ).toBe(1_000)
+  })
+
+  test("caps oversized header hints at the runtime timer limit", () => {
+    expect(McpRateLimit.delay(new Headers({ "retry-after": "999999999" }), 0, { now, random: 0 })).toBe(2_147_483_647)
+    expect(McpRateLimit.delay(new Headers({ "ratelimit-reset": "999999999" }), 0, { now, random: 0 })).toBe(
+      2_147_483_647,
+    )
+  })
+
+  test.each(["January 1, 2099", "Jan 1, 2099", "2099-01-01T00:00:00Z", "Tomorrow", "sun, 06 nov 1994 08:49:37 gmt"])(
+    "rejects alphabetic non-HTTP-date Retry-After value %p",
+    (value) => {
+      expect(McpRateLimit.delay(new Headers({ "retry-after": value }), 0, { now, random: 0 })).toBe(500)
+      expect(
+        McpRateLimit.delay(new Headers({ "retry-after": value, "ratelimit-reset": "9" }), 0, { now, random: 0 }),
+      ).toBe(9_000)
+    },
+  )
+
+  // Well-formed grammar, invalid instant: these must not be trusted as deadlines.
+  test.each([
+    // 2026-01-02 is a Friday, not a Monday.
+    "Mon, 02 Jan 2026 03:04:09 GMT",
+    "Fri, 30 Feb 2024 12:00:00 GMT",
+    "Fri, 02 Jan 0026 03:04:09 GMT",
+  ])("falls back when Retry-After is a well-formed but invalid HTTP-date %p", (value) => {
+    expect(McpRateLimit.delay(new Headers({ "retry-after": value }), 0, { now, random: 0 })).toBe(500)
+    expect(
+      McpRateLimit.delay(new Headers({ "retry-after": value, "ratelimit-reset": "9" }), 0, { now, random: 0 }),
+    ).toBe(9_000)
+  })
+
+  // `now` is 2026-01-02T03:04:05Z, so each of these is four seconds ahead.
+  test.each([
+    ["rfc850", "Friday, 02-Jan-26 03:04:09 GMT"],
+    ["asctime padded day", "Fri Jan 02 03:04:09 2026"],
+    ["asctime single digit day", "Fri Jan  2 03:04:09 2026"],
+  ])("accepts the obsolete %s HTTP-date form", (_form, value) => {
+    expect(McpRateLimit.delay(new Headers({ "retry-after": value }), 0, { now, random: 0 })).toBe(4_000)
+  })
 })
 
 describe("McpRateLimit.RetryTransport", () => {
@@ -138,6 +221,257 @@ describe("McpRateLimit.RetryTransport", () => {
     await transport.close()
 
     await expect(send).rejects.toBeDefined()
+  })
+
+  test("aborts a hung in-flight fetch when the transport closes", async () => {
+    const entered = Promise.withResolvers<void>()
+    let requests = 0
+    const transport = fakeTransport((_url, init) => {
+      requests++
+      entered.resolve()
+      return hangUntilAborted(init?.signal)
+    })
+    const send = transport.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} })
+    await entered.promise
+
+    await transport.close()
+
+    expect(await settled(send)).toMatchObject({ status: "rejected", error: { name: "AbortError" } })
+    expect(requests).toBe(1)
+  })
+
+  test("aborts a hung in-flight fetch when the caller signal aborts", async () => {
+    const entered = Promise.withResolvers<void>()
+    const controller = new AbortController()
+    const endpoint = new URL("https://mcp.example.test")
+    let requests = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (retry) => ({
+        start: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        finishAuth: () => Promise.resolve(),
+        send: (message) =>
+          retry(endpoint, {
+            method: "POST",
+            body: JSON.stringify(message),
+            signal: controller.signal,
+          }).then(() => {}),
+      }),
+      {
+        fetch: (_url, init) => {
+          requests++
+          entered.resolve()
+          return hangUntilAborted(init?.signal)
+        },
+      },
+    )
+    const send = transport.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} })
+    await entered.promise
+
+    controller.abort("cancelled by caller")
+
+    try {
+      expect(await settled(send)).toEqual({ status: "rejected", error: "cancelled by caller" })
+      expect(requests).toBe(1)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("aborts a hung in-flight fetch when the SDK marks the request inactive", async () => {
+    const entered = Promise.withResolvers<void>()
+    let active = true
+    let requests = 0
+    const transport = fakeTransport((_url, init) => {
+      requests++
+      entered.resolve()
+      return hangUntilAborted(init?.signal)
+    })
+    const send = transport.send(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+      { isRequestActive: () => active },
+    )
+    await entered.promise
+
+    active = false
+
+    try {
+      expect(await settled(send)).toMatchObject({
+        status: "rejected",
+        error: { name: "AbortError", message: "MCP request was cancelled" },
+      })
+      expect(requests).toBe(1)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  // Headers are not the end of the request: the SDK reads the JSON reply afterwards,
+  // so a server that answers 200 and then stalls must still observe cancellation.
+  test("cancels a stalled successful JSON body when the SDK marks the request inactive", async () => {
+    const headers = Promise.withResolvers<void>()
+    let active = true
+    let cancelled = 0
+    let requests = 0
+    const transport = bodyTransport(
+      () => {
+        requests++
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull: () => new Promise<void>(() => {}),
+              cancel() {
+                cancelled++
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+      },
+      async (response) => {
+        headers.resolve()
+        await response.text()
+      },
+    )
+    const send = transport.send(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+      { isRequestActive: () => active },
+    )
+    await headers.promise
+
+    active = false
+
+    try {
+      expect(await settled(send)).toMatchObject({
+        status: "rejected",
+        error: { name: "AbortError", message: "MCP request was cancelled" },
+      })
+      expect(cancelled).toBe(1)
+      expect(requests).toBe(1)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("cancels a stalled POST SSE body when the SDK marks the request inactive", async () => {
+    const opened = Promise.withResolvers<void>()
+    const encoder = new TextEncoder()
+    let active = true
+    let cancelled = 0
+    let requests = 0
+    const transport = bodyTransport(
+      () => {
+        requests++
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(": open\n\n"))
+              },
+              pull: () => new Promise<void>(() => {}),
+              cancel() {
+                cancelled++
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+        )
+      },
+      async (response) => {
+        const body = response.body
+        if (!body) throw new Error("expected an SSE body")
+        const reader = body.getReader()
+        await reader.read()
+        opened.resolve()
+        await reader.read()
+      },
+    )
+    const send = transport.send(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+      { isRequestActive: () => active },
+    )
+    await opened.promise
+
+    active = false
+
+    try {
+      expect(await settled(send)).toMatchObject({
+        status: "rejected",
+        error: { name: "AbortError", message: "MCP request was cancelled" },
+      })
+      expect(cancelled).toBe(1)
+      expect(requests).toBe(1)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  // Watching the body for request-active cancellation must not unhook the signals the
+  // fetch was already composed from.
+  test("keeps transport close wired to a watched successful body", async () => {
+    const headers = Promise.withResolvers<void>()
+    let requests = 0
+    const transport = bodyTransport(
+      (_url, init) => {
+        requests++
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                init?.signal?.addEventListener(
+                  "abort",
+                  () => controller.error(new DOMException("This operation was aborted", "AbortError")),
+                  { once: true },
+                )
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+      },
+      async (response) => {
+        headers.resolve()
+        await response.text()
+      },
+    )
+    const send = transport.send(
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+      { isRequestActive: () => true },
+    )
+    await headers.promise
+
+    await transport.close()
+
+    expect(await settled(send)).toMatchObject({ status: "rejected", error: { name: "AbortError" } })
+    expect(requests).toBe(1)
+  })
+
+  // The interval outlives a promise that was never created, so clearing it off the
+  // fetch result leaks a timer that keeps polling a request that already failed.
+  test("clears the request-active poll when a custom fetch throws synchronously", async () => {
+    const failure = new Error("fetch exploded before returning a promise")
+    let polls = 0
+    const transport = fakeTransport(() => {
+      throw failure
+    })
+
+    await expect(
+      transport.send(
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+        {
+          isRequestActive: () => {
+            polls++
+            return true
+          },
+        },
+      ),
+    ).rejects.toBe(failure)
+
+    const observed = polls
+    // Four poll intervals: a leaked timer would have run several more times by now.
+    await Bun.sleep(100)
+    expect(polls).toBe(observed)
   })
 
   test("inner transport close interrupts pending retry backoff", async () => {
@@ -645,6 +979,52 @@ function fakeTransport(fetch: FetchLike, wait?: McpRateLimit.Wait) {
     }),
     { fetch, wait },
   )
+}
+
+// Hands the returned response to the test so it can consume the body the way the SDK
+// does, instead of discarding it the moment the headers arrive.
+function bodyTransport(fetch: FetchLike, consume: (response: Response) => Promise<void>) {
+  const endpoint = new URL("https://mcp.example.test")
+  return new McpRateLimit.RetryTransport(
+    endpoint,
+    (retry) => ({
+      start: () => Promise.resolve(),
+      close: () => Promise.resolve(),
+      finishAuth: () => Promise.resolve(),
+      send: async (message: JSONRPCMessage) => {
+        const response = await retry(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(message),
+        })
+        await consume(response)
+      },
+    }),
+    { fetch },
+  )
+}
+
+// Models a request the server never answers: it settles only when the fetch signal
+// aborts, so a retry loop that cannot abort its own fetch simply never finishes.
+function hangUntilAborted(signal: AbortSignal | null | undefined) {
+  return new Promise<Response>((_resolve, reject) => {
+    if (!signal) return
+    const abort = () => reject(signal.reason)
+    signal.addEventListener("abort", abort, { once: true })
+    if (signal.aborted) abort()
+  })
+}
+
+// A send that can never be aborted would otherwise stall the suite instead of
+// failing, so the assertion is taken against a bounded outcome.
+function settled(promise: Promise<unknown>) {
+  return Promise.race([
+    promise.then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    ),
+    Bun.sleep(1_000).then(() => ({ status: "pending" as const })),
+  ])
 }
 
 function messageId(body: BodyInit | null | undefined) {
