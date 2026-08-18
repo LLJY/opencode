@@ -235,9 +235,9 @@ const OpenAIResponsesEvent = Schema.Struct({
     ),
   ),
   error: optionalNull(OpenAIResponsesErrorPayload),
-  code: Schema.optional(Schema.String),
+  code: optionalNull(Schema.String),
   message: Schema.optional(Schema.String),
-  param: Schema.optional(Schema.String),
+  param: optionalNull(Schema.String),
 })
 type OpenAIResponsesEvent = Schema.Schema.Type<typeof OpenAIResponsesEvent>
 
@@ -832,7 +832,12 @@ const onFunctionCallArgumentsDelta = Effect.fn("OpenAIResponses.onFunctionCallAr
   const lifecycle = result.events.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
   events.push(...result.events)
   return [
-    { ...state, hasModelOutput: result.events.length > 0 ? true : state.hasModelOutput, lifecycle, tools: result.tools },
+    {
+      ...state,
+      hasModelOutput: result.events.length > 0 ? true : state.hasModelOutput,
+      lifecycle,
+      tools: result.tools,
+    },
     events,
   ] satisfies StepResult
 })
@@ -900,7 +905,11 @@ const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function*
       return [{ ...state, hasModelOutput: true, lifecycle }, events] satisfies StepResult
     }
     return [
-      { ...state, hasModelOutput: true, lifecycle: Lifecycle.reasoningEnd(state.lifecycle, events, item.id, providerMetadata) },
+      {
+        ...state,
+        hasModelOutput: true,
+        lifecycle: Lifecycle.reasoningEnd(state.lifecycle, events, item.id, providerMetadata),
+      },
       events,
     ] satisfies StepResult
   }
@@ -966,6 +975,7 @@ const providerError = (event: OpenAIResponsesEvent, fallback: string, state?: Pa
 
 const TRANSIENT_PROVIDER_ERROR_CODES = new Set([
   "stream_incomplete",
+  "request_timeout",
   "server_error",
   "overload",
   "overload_error",

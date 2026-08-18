@@ -12,6 +12,7 @@ export interface OpenAIPromptCacheOptionsInput {
 export interface OpenAIOptionsInput {
   readonly [key: string]: unknown
   readonly store?: boolean
+  readonly previousResponseId?: string
   readonly promptCacheKey?: string
   readonly promptCacheOptions?: OpenAIPromptCacheOptionsInput
   readonly reasoningEffort?: ReasoningEffort
@@ -35,6 +36,7 @@ const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): Provide
   const openai = Object.fromEntries(
     definedEntries({
       store: options?.store,
+      previousResponseId: options?.previousResponseId,
       promptCacheKey: options?.promptCacheKey,
       promptCacheOptions: options?.promptCacheOptions,
       reasoningEffort: options?.reasoningEffort,

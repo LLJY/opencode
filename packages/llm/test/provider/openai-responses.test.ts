@@ -80,6 +80,24 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("lowers typed previous response IDs from the OpenAI facade", () =>
+    Effect.gen(function* () {
+      const provider = OpenAI.configure({
+        apiKey: "test",
+        providerOptions: { openai: { previousResponseId: "resp_typed" } },
+      })
+      const http = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.updateRequest(request, { model: provider.responses("gpt-4.1-mini") }),
+      )
+      const websocket = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.updateRequest(request, { model: provider.responsesWebSocket("gpt-4.1-mini") }),
+      )
+
+      expect(http.body.previous_response_id).toBe("resp_typed")
+      expect(websocket.body.previous_response_id).toBe("resp_typed")
+    }),
+  )
+
   it.effect("omits unsupported semantic service tiers", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(
@@ -1528,6 +1546,45 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("marks request timeout error events before output safe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(sseEvents({ type: "error", code: "request_timeout", message: "Request timed out." })),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "request_timeout: Request timed out.",
+        retryable: true,
+        providerMetadata: { openai: { autoReplaySafe: true } },
+      })
+    }),
+  )
+
+  it.effect("marks request timeout error events after output unsafe for replay", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "partial" },
+              { type: "error", code: "request_timeout", message: "Request timed out." },
+            ),
+          ),
+        ),
+      )
+
+      expect(response.events.at(-1)).toEqual({
+        type: "provider-error",
+        message: "request_timeout: Request timed out.",
+        retryable: true,
+        providerMetadata: { openai: { autoReplaySafe: false } },
+      })
+    }),
+  )
+
   it.effect("marks retryable response.failed after output unsafe for replay", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
@@ -1786,9 +1843,7 @@ describe("OpenAI Responses route", () => {
   it.effect("emits provider-error for unknown response.done terminals", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
-        Effect.provide(
-          fixedResponse(sseEvents({ type: "response.done", response: { id: "resp_done_unknown" } })),
-        ),
+        Effect.provide(fixedResponse(sseEvents({ type: "response.done", response: { id: "resp_done_unknown" } }))),
       )
 
       expect(response.events).toEqual([
@@ -1924,6 +1979,26 @@ describe("OpenAI Responses route", () => {
           classification: "context-overflow",
         },
       ])
+    }),
+  )
+
+  it.effect("accepts nullable fields in spec-compliant error events", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "error",
+              code: null,
+              message: "Something went wrong",
+              param: null,
+              sequence_number: 1,
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([{ type: "provider-error", message: "Something went wrong" }])
     }),
   )
 
