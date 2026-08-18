@@ -318,6 +318,13 @@ const redactBody = (body: string, request: HttpClientRequest.HttpClientRequest) 
 // trade a stuck caller for a second fiber stuck forever. `interruptUnsafe` is the same
 // signal `Effect.runCallback`'s interruptor uses: synchronous, nothing to await, and no
 // fiber created to deliver it.
+//
+// The signalled fiber unwinds into the stream's own reader-cancel finalizer, so against
+// a cancel that never settles it stays parked there. Nothing returned from here refers
+// to that fiber and the buffer is released once it has been copied, so the parked frame
+// is reachable only through the provider's own pending cancel and holds nothing beyond
+// the reader the provider is already holding: it is collected with the abandoned
+// response rather than accumulating one live fiber per hostile error.
 const errorBody = Effect.fnUntraced(function* (response: HttpClientResponse.HttpClientResponse) {
   const chunks: Uint8Array[] = []
   const full = yield* Deferred.make<void>()
@@ -353,6 +360,10 @@ const errorBody = Effect.fnUntraced(function* (response: HttpClientResponse.Http
     bytes.set(chunk, offset)
     return offset + chunk.length
   }, 0)
+  // Released rather than left for the signalled read to drop: that read may still be
+  // parked in a cancel the provider never settles, and it would otherwise keep the
+  // whole buffer alive for as long as the provider keeps the stream.
+  chunks.length = 0
   // A cut can land inside a multi-byte sequence, and decoding that tail would report a
   // real character as U+FFFD, so a clipped sequence is dropped instead.
   const end = !complete || size === BODY_READ_LIMIT ? completeScalarEnd(bytes) : size

@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect, Fiber, Layer } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Permission } from "@/permission"
@@ -37,6 +37,48 @@ const cleared = (id: PermissionV1.ID) =>
       `timed out waiting for ${id} workflow approval to clear`,
     )
   })
+
+describe("session.llm workflow preapproval", () => {
+  const rule = (permission: string, action: PermissionV1.Rule["action"], pattern = "*") => ({
+    permission,
+    pattern,
+    action,
+  })
+
+  test("preapproves only an explicit allow", () => {
+    expect(
+      LLM.workflowPreapprovedTools(
+        ["allowed", "asked", "denied", "unmatched"],
+        [rule("allowed", "allow"), rule("asked", "ask"), rule("denied", "deny")],
+      ),
+    ).toEqual(["allowed"])
+  })
+
+  test("does not preapprove a tool whose allow is scoped to a pattern", () => {
+    // The workflow decides before any arguments exist, so an allow that only covers
+    // `git status` cannot stand in for every call the model might make.
+    expect(LLM.workflowPreapprovedTools(["bash"], [rule("bash", "allow", "git status")])).toEqual([])
+    expect(LLM.workflowPreapprovedTools(["bash"], [rule("bash", "allow", "*")])).toEqual(["bash"])
+  })
+
+  test("resolves the permission alias each tool asks with", () => {
+    expect(
+      LLM.workflowPreapprovedTools(["write", "apply_patch", "read_mcp_resource"], [rule("edit", "allow")]),
+    ).toEqual(["write", "apply_patch"])
+    expect(LLM.workflowPreapprovedTools(["read_mcp_resource"], [rule("read", "allow")])).toEqual([
+      "read_mcp_resource",
+    ])
+  })
+
+  test("keeps the last matching rule authoritative", () => {
+    expect(LLM.workflowPreapprovedTools(["bash"], [rule("*", "allow"), rule("bash", "deny")])).toEqual([])
+    expect(LLM.workflowPreapprovedTools(["bash"], [rule("bash", "deny"), rule("*", "allow")])).toEqual(["bash"])
+  })
+
+  test("preapproves nothing without a ruleset", () => {
+    expect(LLM.workflowPreapprovedTools(["bash", "edit", "lookup"], [])).toEqual([])
+  })
+})
 
 describe("session.llm workflow approval", () => {
   it.instance("aborting removes the pending workflow permission and rejects approval", () =>
