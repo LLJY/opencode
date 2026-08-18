@@ -240,7 +240,10 @@ function processorLayer(
   return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer]])
 }
 
-function rollbackFailureSessionLayer() {
+// `skip` chooses which removal in the rollback fails, so a failure partway through the
+// attempt can be told apart from one on the very first part.
+function rollbackFailureSessionLayer(skip = 0) {
+  let seen = 0
   let failed = false
   return Layer.effect(
     Session.Service,
@@ -249,7 +252,7 @@ function rollbackFailureSessionLayer() {
       return Session.Service.of({
         ...session,
         removePart: (input: Parameters<Session.Interface["removePart"]>[0]) =>
-          failed
+          failed || seen++ < skip
             ? session.removePart(input)
             : Effect.sync(() => {
                 failed = true
@@ -3728,6 +3731,82 @@ isolatedIt.live("session.processor effect tests stop when committed-boundary rol
         })
 
         yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer())))
+      }),
+    { config: cfg },
+  ),
+)
+
+// Nothing restores a part once its removal committed, so a failure partway through the
+// rollback must not abandon the removals behind it: the reasoning part is the one that
+// cannot be removed, and the step-start queued after it still has to go.
+isolatedIt.live("session.processor effect tests remove the rest of an attempt when a later rollback removal fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const llm = llmStub()
+        llm.push(
+          Stream.make(
+            LLMEvent.stepStart({ index: 0 }),
+            LLMEvent.reasoningStart({ id: "reasoning_1" }),
+            LLMEvent.reasoningDelta({ id: "reasoning_1", text: "thinking" }),
+            LLMEvent.textStart({ id: "text_1" }),
+            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+          ).pipe(
+            Stream.concat(
+              Stream.fail(
+                new JSONParseError({
+                  text: '{"type":"response.output_text.delta"',
+                  cause: new SyntaxError("Unexpected end of JSON input"),
+                }),
+              ),
+            ),
+          ),
+        )
+
+        const effect = Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "rollback failure partway through the attempt")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "rollback failure partway through the attempt" }],
+            tools: {},
+          })
+
+          const parts = yield* MessageV2.parts(msg.id)
+
+          expect(value).toBe("stop")
+          expect(llm.calls).toBe(1)
+          expect(handle.message.error).toBeDefined()
+          // Removal runs newest first, so the reasoning part is the second of three and
+          // the step-start behind it is the one an aborted loop would strand. Halting
+          // re-persists the in-flight text and reasoning parts, so the step-start is
+          // what the assertion turns on.
+          expect(parts.map((part) => part.type)).toEqual(["reasoning", "text"])
+          expect(parts.some((part) => part.type === "step-start")).toBe(false)
+        })
+
+        yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer(1))))
       }),
     { config: cfg },
   ),

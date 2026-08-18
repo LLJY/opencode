@@ -931,24 +931,25 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      // Each part is removed by its own durable event, so there is no transaction that
+      // spans the attempt and nothing can restore a row once its removal committed.
+      // Failing out of the loop would therefore strand every part behind the failure
+      // while the ones ahead of it are already gone. Every removal is attempted instead,
+      // and only then is the first failure re-raised so the caller still halts on a
+      // rollback it could not complete rather than replaying over the remainder.
       const rollbackCurrentAttempt = Effect.fn("SessionProcessor.rollbackCurrentAttempt")(function* () {
-        if (ctx.attemptPartIDs.length === 0) {
-          restoreReplayState()
-          yield* session.updateMessage(ctx.assistantMessage)
-          resetAttemptState()
-          return
-        }
-
-        yield* Effect.forEach(
-          [...ctx.attemptPartIDs].reverse(),
-          (partID) =>
+        const outcomes = yield* Effect.forEach([...ctx.attemptPartIDs].reverse(), (partID) =>
+          Effect.exit(
             session.removePart({
               sessionID: ctx.sessionID,
               messageID: ctx.assistantMessage.id,
               partID,
             }),
-          { discard: true },
+          ),
         )
+        const failed = outcomes.find(Exit.isFailure)
+        if (failed) return yield* Effect.failCause(failed.cause)
+
         restoreReplayState()
         yield* session.updateMessage(ctx.assistantMessage)
         resetAttemptState()

@@ -17,7 +17,6 @@ import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
-import { Wildcard } from "@/util/wildcard"
 import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
@@ -140,11 +139,10 @@ const live: Layer.Layer<
           }
         }
 
-        const ruleset = Permission.merge(input.agent.permission ?? [], input.permission ?? [])
-        workflowModel.sessionPreapprovedTools = Object.keys(prepared.tools).filter((name) => {
-          const match = ruleset.findLast((rule) => Wildcard.match(name, rule.permission))
-          return !match || match.action !== "ask"
-        })
+        workflowModel.sessionPreapprovedTools = workflowPreapprovedTools(
+          Object.keys(prepared.tools),
+          Permission.merge(input.agent.permission ?? [], input.permission ?? []),
+        )
 
         const approvedToolsForSession = new Set<string>()
         workflowModel.approvalHandler = bridge.bind(async (approvalTools) => {
@@ -398,6 +396,18 @@ export function createWorkflowModelFacade<T extends GitLabWorkflowLanguageModel>
       return true
     },
   })
+}
+
+// The workflow service treats this list as "already authorized" and skips
+// `approvalHandler` for every name on it, so it is the only gate in front of the tool
+// executor — and that executor runs the local handler, plugin `tool.execute.before`
+// hook included. A preapproval is decided before any arguments exist, so it only holds
+// if the rule holds for every pattern: the local evaluator is asked with the tool's
+// permission alias and the `*` pattern, and only an explicit `allow` counts. An
+// unmatched tool falls through the evaluator's `ask` default, so `ask` and `deny` alike
+// stay off the list and reach the workflow's approval round trip first.
+export function workflowPreapprovedTools(tools: ReadonlyArray<string>, ruleset: PermissionV1.Ruleset) {
+  return tools.filter((name) => Permission.evaluate(Permission.alias(name), "*", ruleset).action === "allow")
 }
 
 // `Permission.ask` removes a pending request when interrupted. Keeping the abort race

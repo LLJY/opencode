@@ -721,6 +721,60 @@ describe("RequestExecutor", () => {
     )
   })
 
+  // Signalling the abandoned read leaves it parked in the provider's own cancel, which
+  // is the provider's to hold. What must not happen is the runtime holding it too: that
+  // would strand one live read, and the buffer it filled, per hostile error for the rest
+  // of the process. Nothing the diagnostic keeps refers back to the read, so once the
+  // response is dropped the whole abandoned island is collectable.
+  it.live("does not retain an abandoned read whose cancel never settles", () => {
+    const sources: WeakRef<object>[] = []
+    const chunk = new TextEncoder().encode("x".repeat(4_096))
+    // Built per request and never held by the layer, so the only thing that could keep a
+    // source alive is the read the executor abandoned.
+    const lazyLayer = RequestExecutor.layer.pipe(
+      Layer.provide(
+        Layer.succeed(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.sync(() => {
+              const source = {
+                pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+                  controller.enqueue(chunk)
+                },
+                cancel() {
+                  return new Promise<void>(() => {})
+                },
+              }
+              sources.push(new WeakRef(source))
+              return HttpClientResponse.fromWeb(
+                request,
+                new Response(new ReadableStream<Uint8Array>(source), { status: 401 }),
+              )
+            }),
+          ),
+        ),
+      ),
+    )
+
+    return Effect.gen(function* () {
+      const executor = yield* RequestExecutor.Service
+
+      for (const _ of [1, 2, 3, 4, 5]) {
+        const error = yield* executor.execute(request).pipe(Effect.flip, Effect.timeout("2 seconds"))
+        expectLLMError(error)
+        expect(errorHttp(error)?.body).toHaveLength(16_384)
+      }
+
+      yield* Effect.sleep("50 millis")
+      Bun.gc(true)
+      yield* Effect.sleep("10 millis")
+      Bun.gc(true)
+
+      expect(sources).toHaveLength(5)
+      expect(sources.filter((ref) => ref.deref() !== undefined)).toHaveLength(0)
+    }).pipe(Effect.provide(lazyLayer))
+  })
+
   // Two secrets reach the tail: one only overlaps it by chance, the other is the one
   // actually cut. Repairing per secret would let the accidental overlap cut first and
   // hide the real match, leaving the head of the cut secret in the report.
