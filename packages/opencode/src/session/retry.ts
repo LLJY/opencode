@@ -1,6 +1,7 @@
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Clock, Duration, Effect, Schedule } from "effect"
+import { HttpDate } from "@/util/http-date"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
 
@@ -43,43 +44,62 @@ function cap(ms: number) {
 }
 
 export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
-  if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (Number.isFinite(parsedMs) && parsedMs > 0) return cap(parsedMs)
-      }
+  const headers = error?.data.responseHeaders
+  // Headers absent, or present but carrying no usable retry-after hint. Apply the
+  // same 30s cap as the no-headers branch so a flaky 5xx with normal response
+  // headers (content-type, date, ...) cannot grow the backoff past
+  // RETRY_MAX_DELAY_NO_HEADERS.
+  if (!headers) return bounded(attempt, random)
 
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (Number.isFinite(parsedSeconds) && parsedSeconds > 0) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
+  // A header that parses is authoritative even when it asks for no wait: a provider
+  // that sends `retry-after-ms: 0` is saying "retry immediately", which is not an
+  // invitation to honour a header it ranked lower. A non-positive hint therefore
+  // falls to bounded backoff, and only a header that fails its grammar defers to the
+  // next one.
+  const millis = parseUnsigned(headers["retry-after-ms"], DECIMAL)
+  if (millis !== undefined) return millis > 0 ? cap(millis) : bounded(attempt, random)
 
-      // Headers were present but carried no usable retry-after hint. Apply the
-      // same 30s cap as the no-headers branch so a flaky 5xx with normal
-      // response headers (content-type, date, ...) cannot grow the backoff
-      // past RETRY_MAX_DELAY_NO_HEADERS.
-      return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
-    }
+  const retryAfter = headers["retry-after"]
+  if (retryAfter !== undefined) {
+    const seconds = parseUnsigned(retryAfter, DELTA_SECONDS)
+    // convert seconds to milliseconds
+    if (seconds !== undefined) return seconds > 0 ? cap(Math.ceil(seconds * 1000)) : bounded(attempt, random)
+
+    // Try parsing as HTTP date format
+    const now = Date.now()
+    const parsed = HttpDate.parse(retryAfter.trim(), now)
+    if (parsed !== undefined) return parsed > now ? cap(parsed - now) : bounded(attempt, random)
   }
 
+  return bounded(attempt, random)
+}
+
+function bounded(attempt: number, random: number) {
   return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
 function exponential(attempt: number, random: number) {
   const base = RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1)
   return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
+}
+
+// RFC 9110 5.6.7 delta-seconds is `1*DIGIT`, so a standard `Retry-After: 1.5` is
+// malformed and falls through to the HTTP-date form and then to bounded backoff.
+// The proprietary `retry-after-ms` header has no such grammar and providers do send
+// fractions there, so it keeps accepting them. Everything `Number` would otherwise
+// accept — signs, exponents, hex, `Infinity` — is rejected in both cases so a
+// malformed header falls through instead of becoming a bogus delay. Zero parses:
+// telling zero apart from malformed is what lets a valid "no wait" hint outrank the
+// headers behind it.
+const DECIMAL = /^\d+(?:\.\d+)?$/
+const DELTA_SECONDS = /^\d+$/
+
+function parseUnsigned(value: string | undefined, grammar: RegExp) {
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  if (!grammar.test(trimmed)) return undefined
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 export function retryable(error: Err, provider: string) {

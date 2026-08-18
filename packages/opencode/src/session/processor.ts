@@ -26,7 +26,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
-import { JSONParseError } from "ai"
+import { APICallError, JSONParseError } from "ai"
 
 const DOOM_LOOP_THRESHOLD = 3
 const textChunks = new WeakMap<{ text: string }, string[]>()
@@ -273,6 +273,32 @@ const layer = Layer.effect(
         ctx.attemptNeedsReset = false
       }
 
+      // A tool can run without the processor ever seeing an event for it: the stream
+      // may fail, or drop its remaining events, after the handler already touched the
+      // world. Recording the crossing before the call is what makes a later throw
+      // count as a possible external effect, so replay stays off the table until a
+      // tool can declare that repeating it is safe. The tools themselves are left
+      // alone — each entry is a new object that still calls the original handler with
+      // the original receiver.
+      function guardToolExecution(tools: LLM.StreamInput["tools"]): LLM.StreamInput["tools"] {
+        return Object.fromEntries(
+          Object.entries(tools).map(([name, item]) => {
+            const execute = item.execute
+            if (!execute) return [name, item]
+            return [
+              name,
+              {
+                ...item,
+                execute: (...args: Parameters<typeof execute>) => {
+                  ctx.attemptHasToolActivity = true
+                  return execute.apply(item, args)
+                },
+              },
+            ]
+          }),
+        )
+      }
+
       function currentResponseStreamInfo(
         message: string,
         transport?: ProviderError.ResponseStreamInfo["transport"],
@@ -302,6 +328,22 @@ const layer = Layer.effect(
         if (!JSONParseError.isInstance(error)) return undefined
         const message = `Provider returned malformed JSON stream: ${error.message.slice(0, 200)}`
         return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), { cause: error })
+      }
+
+      // The provider reports a top-level stream timeout without replay metadata, so
+      // classify it against local attempt state and let the shared replay guards
+      // decide between a safe replay, a rollback, and stopping.
+      function normalizeStreamTimeoutError(error: unknown): ProviderError.ResponseStreamError | undefined {
+        // An HTTP-level failure keeps its own path so status code, response headers,
+        // and body survive for retry-after and 5xx handling.
+        if (APICallError.isInstance(error)) return undefined
+        const message = ProviderError.streamTimeoutMessage(error)
+        if (!message) return undefined
+        return new ProviderError.ResponseStreamError(
+          message,
+          { ...currentResponseStreamInfo(message), retryable: true },
+          { cause: error },
+        )
       }
 
       function normalizeRetryableProviderStreamError(
@@ -915,7 +957,10 @@ const layer = Layer.effect(
       const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
         Effect.gen(function* () {
           const candidate =
-            normalizeNativeResponseStreamError(error) ?? normalizeJsonParseResponseStreamError(error) ?? error
+            normalizeNativeResponseStreamError(error) ??
+            normalizeJsonParseResponseStreamError(error) ??
+            normalizeStreamTimeoutError(error) ??
+            error
           yield* refreshCancelledByUser()
           if (cancelledByUser && cancelInducedTransportCandidate(candidate)) {
             aborted = true
@@ -957,21 +1002,33 @@ const layer = Layer.effect(
             return new ResumeFromPromptLoop(retryable.message, { cause: candidate })
           }
 
-          if (!(candidate instanceof ProviderError.ResponseStreamError)) return candidate
-          if (candidate.info.autoReplaySafe) return candidate
-          // A completed assistant-only step is still local model output and can
-          // be rolled back as one failed attempt. A captured filesystem patch is
-          // an external effect that removing session parts cannot undo.
-          // Only a normally stopped assistant-only step is safe to regenerate.
-          // Deterministic finishes such as content-filter/error remain terminal.
-          if (ctx.attemptCommitted && ctx.assistantMessage.finish !== "stop") return candidate
+          // Everything below decides what to do with rows this attempt already wrote.
+          // It applies to plain retryable errors too: the retry policy would otherwise
+          // rerun the turn on top of them and leave the failed attempt behind.
+          //
+          // Local attempt state outranks the provider's `autoReplaySafe` claim. A
+          // provider only knows what it sent, not what we persisted, so a claim of
+          // "safe" can never authorize replaying over rows that already exist.
+          const streamError = candidate instanceof ProviderError.ResponseStreamError ? candidate : undefined
           if (ctx.attemptPartIDs.length === 0) return candidate
 
+          // A completed assistant-only step is still local model output, so a normally
+          // stopped one can be rolled back and regenerated as a single failed attempt.
+          // Any other committed finish (`length`, `unknown`) is not evidence that the
+          // same step would be produced again, so stop rather than regenerate.
+          // Halting keeps the original error, and with it any status and headers.
+          if (ctx.attemptCommitted && ctx.assistantMessage.finish !== "stop") {
+            return new StopAfterObservedSideEffect(retryable.message, { cause: candidate })
+          }
+
           yield* rollbackCurrentAttempt()
+          // Plain errors are returned unchanged so the retry policy still reads their
+          // status code and retry-after headers.
+          if (!streamError) return candidate
           return new ProviderError.ResponseStreamError(
-            candidate.message,
-            { ...candidate.info, autoReplaySafe: true },
-            { cause: candidate },
+            streamError.message,
+            { ...streamError.info, autoReplaySafe: true },
+            { cause: streamError },
           )
         }).pipe(
           Effect.catchCause((cause) =>
@@ -992,6 +1049,7 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const guarded = { ...streamInput, tools: guardToolExecution(streamInput.tools) }
         return yield* Effect.gen(function* () {
           const outcome = yield* Effect.gen(function* () {
             resetAttemptState()
@@ -999,7 +1057,7 @@ const layer = Layer.effect(
             ctx.reasoningMap = {}
             responseId = undefined
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream(guarded)
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import type { FetchLike, Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js"
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js"
+import { HttpDate } from "@/util/http-date"
 
 const INITIAL_DELAY = 1_000
 const MAX_DELAY = 30_000
@@ -111,30 +112,106 @@ export class RetryTransport implements Transport {
 
     for (let attempt = 0; ; attempt++) {
       ensureActive(signals, active)
-      const response = await this.fetchImpl(url, init)
-      if (response.status !== 429) return response
-      if (!active && attempt >= MAX_UNSCOPED_RETRIES) return response
 
-      const duration = delay(response.headers, attempt, { now: this.now(), random: this.random() })
-      void response.body?.cancel().catch(() => {})
-      await this.wait(duration, signals, active)
+      // A hung fetch has to observe transport close, the caller's abort, and the SDK
+      // request-active callback, so the attempt runs on a composed signal rather than
+      // the caller's own. That signal outlives this call, so a returned SSE body still
+      // aborts on transport close.
+      // A rejection never says whether the server saw the request, so the abort — like
+      // any other transport failure — is surfaced instead of replayed.
+      const cancelled = new AbortController()
+      const composed = AbortSignal.any([...signals, cancelled.signal])
+      const poll = active
+        ? setInterval(() => {
+            if (active()) return
+            cancelled.abort(abortError("MCP request was cancelled"))
+          }, ACTIVE_POLL_INTERVAL)
+        : undefined
+      // A caller-supplied FetchLike may throw before it ever returns a promise, so
+      // the poll is cleared from a finally rather than off a promise that in that
+      // case was never created.
+      let adopted = false
+      try {
+        const response = await this.fetchImpl(url, { ...init, signal: composed })
+
+        const body = response.body
+        if (response.status !== 429) {
+          if (poll === undefined || body === null) return response
+          adopted = true
+          return watchBody(response, body, composed, () => clearInterval(poll))
+        }
+        if (!active && attempt >= MAX_UNSCOPED_RETRIES) return response
+
+        const duration = delay(response.headers, attempt, { now: this.now(), random: this.random() })
+        void response.body?.cancel().catch(() => {})
+        await this.wait(duration, signals, active)
+      } finally {
+        if (!adopted && poll !== undefined) clearInterval(poll)
+      }
     }
   }
 }
 
+// Headers are not the end of an MCP request: a stalled JSON reply or a POST SSE
+// stream is still the same in-flight request, so cancellation stays armed until that
+// body completes, errors, or is cancelled. The signal watched here is the same one
+// the fetch runs on, so transport close and the caller's own abort still tear the
+// body down; this only extends them, and the SDK's request-active callback, past the
+// headers. Settling on either end also bounds the poll's lifetime.
+function watchBody(
+  response: Response,
+  source: NonNullable<Response["body"]>,
+  signal: AbortSignal,
+  stop: () => void,
+) {
+  const reader = source.getReader()
+  let settled = false
+  let abort: (() => void) | undefined
+  const settle = () => {
+    if (settled) return false
+    settled = true
+    if (abort) signal.removeEventListener("abort", abort)
+    stop()
+    return true
+  }
+
+  const body = new ReadableStream({
+    start(controller) {
+      abort = () => {
+        if (!settle()) return
+        controller.error(abortError(signal.reason))
+        void reader.cancel(signal.reason).catch(() => {})
+      }
+      signal.addEventListener("abort", abort, { once: true })
+      if (signal.aborted) abort()
+    },
+    async pull(controller) {
+      const chunk = await reader.read().catch((error: unknown) => {
+        if (settle()) controller.error(error)
+        return undefined
+      })
+      if (chunk === undefined || settled) return
+      if (!chunk.done) return controller.enqueue(chunk.value)
+      settle()
+      controller.close()
+    },
+    cancel(reason) {
+      settle()
+      return reader.cancel(reason)
+    },
+  })
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+}
+
 export function delay(headers: Headers, attempt: number, input: { now?: number; random?: number } = {}) {
   const now = input.now ?? Date.now()
-  const retryAfter = parseRetryAfter(headers.get("retry-after"), now)
-  if (retryAfter !== undefined && retryAfter > 0) return cap(retryAfter)
-
-  const reset = parseSeconds(headers.get("ratelimit-reset"))
-  if (reset !== undefined && reset > 0) return cap(reset * 1_000)
-
-  const resetAfter = parseSeconds(headers.get("x-ratelimit-reset-after"))
-  if (resetAfter !== undefined && resetAfter > 0) return cap(resetAfter * 1_000)
-
-  const resetAt = parseSeconds(headers.get("x-ratelimit-reset"))
-  if (resetAt !== undefined && resetAt * 1_000 > now) return cap(resetAt * 1_000 - now)
+  const hint = headerDelay(headers, now)
+  if (hint !== undefined && hint > 0) return cap(hint)
 
   const exponential = Math.min(INITIAL_DELAY * Math.pow(2, Math.max(0, Math.floor(attempt))), MAX_DELAY)
   const sample = input.random ?? Math.random()
@@ -142,6 +219,29 @@ export function delay(headers: Headers, attempt: number, input: { now?: number; 
   return Math.ceil(exponential / 2 + (exponential / 2) * jitter)
 }
 
+// The first header that parses wins outright. A server that sends `Retry-After: 0`
+// or an already elapsed deadline is saying "no wait is required", which is not an
+// invitation to honour a header it ranked lower, so a non-positive hint falls to
+// bounded backoff instead of to the reset headers behind it. Only a header that
+// fails its grammar defers to the next one.
+function headerDelay(headers: Headers, now: number) {
+  const retryAfter = parseRetryAfter(headers.get("retry-after"), now)
+  if (retryAfter !== undefined) return retryAfter
+
+  const reset = parseSeconds(headers.get("ratelimit-reset"))
+  if (reset !== undefined) return reset * 1_000
+
+  const resetAfter = parseSeconds(headers.get("x-ratelimit-reset-after"))
+  if (resetAfter !== undefined) return resetAfter * 1_000
+
+  const resetAt = parseSeconds(headers.get("x-ratelimit-reset"))
+  if (resetAt !== undefined) return Math.max(0, resetAt * 1_000 - now)
+
+  return undefined
+}
+
+// RFC 9110 5.6.7 delta-seconds is `1*DIGIT`, so a fractional or signed value is
+// malformed and must fall through to the HTTP-date form rather than become a delay.
 function parseRetryAfter(value: string | null, now: number) {
   if (!value) return undefined
   const trimmed = value.trim()
@@ -150,10 +250,8 @@ function parseRetryAfter(value: string | null, now: number) {
     if (Number.isFinite(seconds)) return seconds * 1_000
     return undefined
   }
-  // Numeric-looking non-integers are not valid Retry-After HTTP dates.
-  if (/^[+-]?\d/.test(trimmed)) return undefined
-  const date = Date.parse(trimmed)
-  if (Number.isNaN(date)) return undefined
+  const date = HttpDate.parse(trimmed, now)
+  if (date === undefined) return undefined
   return Math.max(0, date - now)
 }
 

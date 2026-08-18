@@ -62,16 +62,86 @@ describe("session.retry.delay", () => {
 
   test("uses exponential backoff when retry-after-ms is zero", () => {
     const error = apiError({ "retry-after-ms": "0" })
-    const delays = Array.from({ length: 5 }, (_, index) => SessionRetry.delay(index + 1, error))
-    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 32000])
+    const delays = Array.from({ length: 5 }, (_, index) => SessionRetry.delay(index + 1, error, 0))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000])
   })
 
   test.each(["-1", "Infinity"])("ignores invalid retry-after-ms value %s", (value) => {
-    expect(SessionRetry.delay(3, apiError({ "retry-after-ms": value }))).toBe(8000)
+    expect(SessionRetry.delay(3, apiError({ "retry-after-ms": value }), 0)).toBe(8000)
+  })
+
+  // A parseable hint is authoritative even when it asks for no wait, so it must not
+  // hand control to the header the provider ranked below it.
+  test.each(["0", "0.0", " 0 "])("a retry-after-ms of %p preempts retry-after", (value) => {
+    expect(SessionRetry.delay(3, apiError({ "retry-after-ms": value, "retry-after": "30" }), 0)).toBe(8000)
+  })
+
+  test("a malformed retry-after-ms still defers to retry-after", () => {
+    expect(SessionRetry.delay(3, apiError({ "retry-after-ms": "0ms", "retry-after": "30" }), 0)).toBe(30000)
+  })
+
+  test("an elapsed retry-after HTTP-date does not fall back to the millisecond header", () => {
+    const elapsed = new Date(Date.now() - 5_000).toUTCString()
+    expect(SessionRetry.delay(3, apiError({ "retry-after": elapsed }), 0)).toBe(8000)
   })
 
   test.each(["0", "-1", "Infinity"])("ignores invalid retry-after seconds value %s", (value) => {
-    expect(SessionRetry.delay(3, apiError({ "retry-after": value }))).toBe(8000)
+    expect(SessionRetry.delay(3, apiError({ "retry-after": value }), 0)).toBe(8000)
+  })
+
+  test.each([
+    ["retry-after-ms", "10ms"],
+    ["retry-after-ms", "+5garbage"],
+    ["retry-after", "30 seconds"],
+  ])("ignores malformed %s value %s", (header, value) => {
+    expect(SessionRetry.delay(10, apiError({ [header]: value }), 0)).toBe(30000)
+  })
+
+  test.each(["January 1, 2099", "Jan 1, 2099", "2099-01-01T00:00:00Z", "Tomorrow", "sun, 06 nov 1994 08:49:37 gmt"])(
+    "ignores alphabetic non-HTTP-date retry-after value %p",
+    (value) => {
+      expect(SessionRetry.delay(10, apiError({ "retry-after": value }), 0)).toBe(30000)
+    },
+  )
+
+  // Everything `Number` would accept but the header grammar does not.
+  test.each(["+5", "-5", "1e3", "Infinity", "0x10", "", " ", "5s", ".5"])(
+    "ignores non-decimal retry hint %p in both headers",
+    (value) => {
+      expect(SessionRetry.delay(10, apiError({ "retry-after": value }), 0)).toBe(30000)
+      expect(SessionRetry.delay(10, apiError({ "retry-after-ms": value }), 0)).toBe(30000)
+    },
+  )
+
+  // Far-future values that would otherwise produce a very long wait, so the fallback
+  // to bounded backoff proves the instant was rejected rather than merely clamped.
+  test.each([
+    // 2100-12-31 is a Friday, not a Monday.
+    "Mon, 31 Dec 2100 23:59:59 GMT",
+    "Fri, 30 Feb 2100 23:59:59 GMT",
+    "Fri, 31 Dec 0100 23:59:59 GMT",
+  ])("ignores a well-formed but invalid HTTP-date retry-after %p", (value) => {
+    expect(SessionRetry.delay(10, apiError({ "retry-after": value }), 0)).toBe(30000)
+  })
+
+  test("waits until a valid HTTP-date retry-after", () => {
+    // delay() reads its own Date.now(), so assert the band that separates an honoured
+    // date from the 30s bounded backoff instead of an exact wall-clock difference.
+    const result = SessionRetry.delay(10, apiError({ "retry-after": new Date(Date.now() + 120_000).toUTCString() }), 0)
+    expect(result).toBeGreaterThan(SessionRetry.RETRY_MAX_DELAY_NO_HEADERS)
+    expect(result).toBeLessThanOrEqual(120_000)
+  })
+
+  test("accepts trimmed retry hints", () => {
+    expect(SessionRetry.delay(1, apiError({ "retry-after-ms": " 1.5 " }), 0)).toBe(1.5)
+    expect(SessionRetry.delay(1, apiError({ "retry-after": " 2 " }), 0)).toBe(2000)
+  })
+
+  // RFC 9110 5.6.7 delta-seconds is `1*DIGIT`, so a fractional standard Retry-After is
+  // malformed. The proprietary millisecond header carries no such grammar.
+  test.each(["1.5", "2.0", "0.5"])("ignores fractional standard retry-after value %p", (value) => {
+    expect(SessionRetry.delay(10, apiError({ "retry-after": value }), 0)).toBe(30000)
+    expect(SessionRetry.delay(10, apiError({ "retry-after-ms": value }), 0)).toBe(Number(value))
   })
 
   test("prefers retry-after-ms when shorter than exponential", () => {
@@ -154,7 +224,7 @@ describe("session.retry.delay", () => {
   it.instance("policy stops after five retries", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
-      const error = apiError({ "retry-after-ms": "0" })
+      const error = apiError({ "retry-after-ms": "1" })
       const step = yield* Schedule.toStepWithMetadata(
         SessionRetry.policy({
           provider: "test",
@@ -629,6 +699,27 @@ describe("session.message-v2.fromError", () => {
     expect(result.data.isRetryable).toBe(true)
     expect(SessionRetry.retryable(result, retryProvider)).toEqual({
       message: "An error occurred while processing your request.",
+    })
+  })
+
+  test("converts top-level request_timeout stream chunks to retryable APIError", () => {
+    const result = MessageV2.fromError(
+      {
+        message: JSON.stringify({
+          type: "error",
+          sequence_number: 0,
+          code: "request_timeout",
+          message: "stream error: stream disconnected before completion: stream closed before response.completed",
+        }),
+      },
+      { providerID: ProviderV2.ID.make("cliproxyapi") },
+    )
+
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(true)
+    expect(SessionRetry.retryable(result, retryProvider)).toEqual({
+      message: "stream error: stream disconnected before completion: stream closed before response.completed",
     })
   })
 
