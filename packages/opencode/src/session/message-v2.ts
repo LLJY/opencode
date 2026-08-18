@@ -36,7 +36,7 @@ import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
-import { LLMError } from "@opencode-ai/llm"
+import { HttpContext, LLMError } from "@opencode-ai/llm"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
@@ -643,6 +643,21 @@ function headerTimeoutError(error: unknown) {
   return undefined
 }
 
+// Carrying the response headers is what lets `SessionRetry.delay` honour a native
+// provider's own pacing instead of falling back to blind backoff. The route executor
+// already redacted every header it recorded, so they cross unchanged. The reason's
+// parsed retry hint is restated as `retry-after-ms` because that is the form the delay
+// reads first, and the only one that survives a hint the executor derived from an
+// HTTP-date `Retry-After`. A hint too large to render as a plain decimal is left out
+// rather than written in exponent form, which the delay's grammar would reject anyway.
+function llmRetryHeaders(http: HttpContext | undefined, retryAfterMs: number | undefined) {
+  const headers = http?.response?.headers
+  if (retryAfterMs === undefined || !Number.isFinite(retryAfterMs) || retryAfterMs < 0) return headers
+  const rendered = String(retryAfterMs)
+  if (!/^\d+(?:\.\d+)?$/.test(rendered)) return headers
+  return { ...headers, "retry-after-ms": rendered }
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean; userCancelled?: boolean },
@@ -688,11 +703,14 @@ export function fromError(
         { cause: e },
       ).toObject()
     case e instanceof LLMError:
+      const http = "http" in e.reason ? e.reason.http : undefined
       return new APIError(
         {
           message: e.reason.message,
+          statusCode: http?.response?.status,
           isRetryable: e.retryable,
-          responseBody: "http" in e.reason ? e.reason.http?.body : undefined,
+          responseHeaders: llmRetryHeaders(http, e.retryAfterMs),
+          responseBody: http?.body,
         },
         { cause: e },
       ).toObject()

@@ -865,6 +865,196 @@ describe("McpRateLimit.RetryTransport", () => {
       http.stop(true)
     }
   })
+
+  // The SDK releases a 202 by awaiting `response.body.cancel()`, so a watched body that
+  // hands back the server's own cancel gives a server that never settles it the whole
+  // transport.
+  test("releases a watched Streamable HTTP 202 when the server cancel never settles", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    let cancelled = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      {
+        fetch: () =>
+          Promise.resolve(
+            new Response(
+              new ReadableStream({
+                cancel() {
+                  cancelled++
+                  return new Promise<void>(() => {})
+                },
+              }),
+              { status: 202 },
+            ),
+          ),
+      },
+    )
+    await transport.start()
+
+    try {
+      expect(
+        await settled(
+          transport.send(
+            { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+            { isRequestActive: () => true },
+          ),
+        ),
+      ).toEqual({ status: "resolved" })
+      expect(cancelled).toBe(1)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  // Legacy SSE releases its POST reply the same way, so the success path has to be
+  // covered on both transports.
+  test("releases a watched legacy SSE POST reply when the server cancel never settles", async () => {
+    const encoder = new TextEncoder()
+    let cancelled = 0
+    const http = Bun.serve({
+      port: 0,
+      fetch: () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode("event: endpoint\ndata: /messages\n\n"))
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    })
+    const endpoint = new URL("/sse", http.url)
+    const transport = new McpRateLimit.RetryTransport(endpoint, (fetch) => new SSEClientTransport(endpoint, { fetch }), {
+      // The handshake stays on the real server; only the message POST answers with a
+      // body whose cancel never settles.
+      fetch: (url, init) =>
+        init?.method === "POST"
+          ? Promise.resolve(
+              new Response(
+                new ReadableStream({
+                  cancel() {
+                    cancelled++
+                    return new Promise<void>(() => {})
+                  },
+                }),
+                { status: 200 },
+              ),
+            )
+          : fetch(url, init),
+    })
+
+    try {
+      await transport.start()
+      expect(
+        await settled(
+          transport.send(
+            { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+            { isRequestActive: () => true },
+          ),
+        ),
+      ).toEqual({ status: "resolved" })
+      expect(cancelled).toBe(1)
+    } finally {
+      await transport.close()
+      http.stop(true)
+    }
+  })
+
+  // The SDK renders the 429 it is finally handed by awaiting `response.text()`, so an
+  // error body the server keeps writing would stall the send and allocate everything it
+  // sent. The source is deliberately finite so an unbounded read fails on the reported
+  // size rather than hanging the suite, and the pull count is what proves it stopped
+  // early instead of reading the whole page and slicing it afterwards.
+  test("bounds the final 429 diagnostic body the SDK reads", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    const oversized = oversizedBody(429)
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      { fetch: oversized.fetch, wait: () => Promise.resolve() },
+    )
+    await transport.start()
+
+    try {
+      const result = await settled(
+        transport.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } }),
+      )
+      expect(result).toMatchObject({ status: "rejected", error: { code: 429 } })
+      const reported = result.status === "rejected" ? String((result.error as Error).message) : ""
+      expect(reported).toContain("x".repeat(1_000))
+      expect(reported.length).toBeLessThanOrEqual(16_384 + 256)
+      // Three replays plus the abandoned remainder of the one that was reported.
+      expect(oversized.attempts).toBe(4)
+      expect(oversized.cancelled).toBe(4)
+      expect(oversized.pulled).toBeLessThanOrEqual(8)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("bounds a watched non-429 diagnostic body without leaking the request-active poll", async () => {
+    const endpoint = new URL("https://mcp.example.test")
+    const oversized = oversizedBody(500)
+    let polls = 0
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
+      { fetch: oversized.fetch },
+    )
+    await transport.start()
+
+    try {
+      const result = await settled(
+        transport.send(
+          { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+          {
+            isRequestActive: () => {
+              polls++
+              return true
+            },
+          },
+        ),
+      )
+      expect(result).toMatchObject({ status: "rejected", error: { code: 500 } })
+      const reported = result.status === "rejected" ? String((result.error as Error).message) : ""
+      expect(reported.length).toBeLessThanOrEqual(16_384 + 256)
+      expect(oversized.attempts).toBe(1)
+      expect(oversized.cancelled).toBe(1)
+      expect(oversized.pulled).toBeLessThanOrEqual(8)
+
+      const observed = polls
+      // Four poll intervals: a poll the bounded body failed to settle would keep running.
+      await Bun.sleep(100)
+      expect(polls).toBe(observed)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  // Only error bodies are capped: a success body is the transport's own message stream.
+  test("leaves a successful body larger than the diagnostic cap intact", async () => {
+    let received = ""
+    const transport = bodyTransport(
+      () =>
+        Promise.resolve(
+          new Response("y".repeat(40_960), { status: 200, headers: { "content-type": "application/json" } }),
+        ),
+      async (response) => {
+        received = await response.text()
+      },
+    )
+
+    try {
+      await transport.send(
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
+        { isRequestActive: () => true },
+      )
+      expect(received).toHaveLength(40_960)
+    } finally {
+      await transport.close()
+    }
+  })
 })
 
 it.instance("recovers initialization, catalogs, prompts, resources, and tools after HTTP 429", () =>
@@ -1002,6 +1192,38 @@ function bodyTransport(fetch: FetchLike, consume: (response: Response) => Promis
     }),
     { fetch },
   )
+}
+
+// An error page far past the diagnostic budget. It ends on its own so a read that
+// ignores the budget fails on the size it reports rather than running forever, and it
+// counts pulls so a read that stopped early can be told from one that read it all.
+function oversizedBody(status: number) {
+  const chunk = new TextEncoder().encode("x".repeat(4_096))
+  const state = {
+    attempts: 0,
+    cancelled: 0,
+    pulled: 0,
+    fetch: (): Promise<Response> => {
+      state.attempts++
+      let sent = 0
+      return Promise.resolve(
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              state.pulled++
+              if (sent++ >= 256) return controller.close()
+              controller.enqueue(chunk)
+            },
+            cancel() {
+              state.cancelled++
+            },
+          }),
+          { status },
+        ),
+      )
+    },
+  }
+  return state
 }
 
 // Models a request the server never answers: it settles only when the fetch signal

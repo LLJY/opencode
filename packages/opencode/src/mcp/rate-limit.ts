@@ -136,11 +136,13 @@ export class RetryTransport implements Transport {
 
         const body = response.body
         if (response.status !== 429) {
-          if (poll === undefined || body === null) return response
+          if (poll === undefined || body === null) return boundDiagnosticBody(response)
           adopted = true
-          return watchBody(response, body, composed, () => clearInterval(poll))
+          return boundDiagnosticBody(watchBody(response, body, composed, () => clearInterval(poll)))
         }
-        if (!active && attempt >= MAX_UNSCOPED_RETRIES) return response
+        // Replay stays keyed to the status read off the wire above, so giving up still
+        // hands back a definite 429 — only its diagnostic body is capped.
+        if (!active && attempt >= MAX_UNSCOPED_RETRIES) return boundDiagnosticBody(response)
 
         const duration = delay(response.headers, attempt, { now: this.now(), random: this.random() })
         void response.body?.cancel().catch(() => {})
@@ -195,9 +197,59 @@ function watchBody(
       settle()
       controller.close()
     },
+    // The SDK awaits `response.body.cancel()` on its success paths — Streamable HTTP
+    // 202 and the legacy SSE POST reply both release the connection that way — so
+    // returning the source cancel would hand the whole transport to a server whose
+    // cancel never settles. Releasing this wrapper is unconditional; the source cancel
+    // is the server's promise to keep and is left to settle on its own.
     cancel(reason) {
       settle()
-      return reader.cancel(reason)
+      void reader.cancel(reason).catch(() => {})
+    },
+  })
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+}
+
+// The SDK renders a failed request by awaiting `response.text()`, which reads the body
+// to its end: a server answering an error with an endless or enormous stream would
+// otherwise stall the transport or allocate without limit inside the SDK. Only an error
+// body is capped — a success body is the transport's own message stream and has to keep
+// flowing — and the status and headers pass through untouched, so nothing about which
+// responses are replayed changes. Gating on 4xx/5xx rather than `!response.ok` also
+// keeps the wrapper away from the statuses that forbid a body; the SDK never asks for a
+// redirect it has to read itself.
+const MAX_DIAGNOSTIC_BODY_BYTES = 16_384
+
+function boundDiagnosticBody(response: Response) {
+  const source = response.status < 400 ? null : response.body
+  if (source === null) return response
+
+  const reader = source.getReader()
+  let remaining = MAX_DIAGNOSTIC_BODY_BYTES
+  const body = new ReadableStream({
+    async pull(controller) {
+      const chunk = await reader.read().catch((error: unknown) => {
+        controller.error(error)
+        return undefined
+      })
+      if (chunk === undefined) return
+      if (chunk.done) return controller.close()
+      // Clipped rather than dropped: the budget is spent on the bytes that fit, so one
+      // enormous frame costs the budget instead of its own length.
+      const slice = chunk.value.length <= remaining ? chunk.value : chunk.value.slice(0, remaining)
+      remaining -= slice.length
+      controller.enqueue(slice)
+      if (remaining > 0) return
+      controller.close()
+      void reader.cancel().catch(() => {})
+    },
+    cancel(reason) {
+      void reader.cancel(reason).catch(() => {})
     },
   })
 

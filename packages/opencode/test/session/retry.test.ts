@@ -3,6 +3,14 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, JSONParseError } from "ai"
+import {
+  HttpContext,
+  HttpRequestDetails,
+  HttpResponseDetails,
+  LLMError,
+  RateLimitReason,
+  TransportReason,
+} from "@opencode-ai/llm"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -761,5 +769,88 @@ describe("session.message-v2.fromError", () => {
 
     expect(result.name).toBe("UnknownError")
     expect(SessionRetry.retryable(result, retryProvider)).toEqual({ message: error.message })
+  })
+
+  // The native route runtime reports rate limits as an LLMError. Dropping the status and
+  // headers on the way through leaves SessionRetry with nothing but blind backoff, so
+  // the provider's own pacing has to survive the conversion.
+  test("preserves a native LLM rate limit's status and retry timing", () => {
+    const result = MessageV2.fromError(
+      new LLMError({
+        module: "RequestExecutor",
+        method: "execute",
+        reason: new RateLimitReason({
+          message: "Provider request failed with HTTP 429",
+          retryAfterMs: 7_000,
+          http: new HttpContext({
+            request: new HttpRequestDetails({
+              method: "POST",
+              url: "https://provider.test/v1/chat",
+              headers: { authorization: "<redacted>" },
+            }),
+            response: new HttpResponseDetails({
+              status: 429,
+              headers: { "retry-after": "7", "x-api-key": "<redacted>" },
+            }),
+          }),
+        }),
+      }),
+      { providerID },
+    )
+
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.statusCode).toBe(429)
+    // Carried through exactly as the executor recorded them, redactions included.
+    expect(result.data.responseHeaders).toEqual({
+      "retry-after": "7",
+      "x-api-key": "<redacted>",
+      "retry-after-ms": "7000",
+    })
+    expect(SessionRetry.retryable(result, retryProvider)).toEqual({
+      message: "Provider request failed with HTTP 429",
+    })
+    expect(SessionRetry.delay(1, result, 0)).toBe(7_000)
+  })
+
+  // The executor resolves an HTTP-date `Retry-After` against its own clock, so restating
+  // the parsed hint is what keeps that answer from being recomputed against a later one.
+  test("prefers the native LLM parsed retry hint over an HTTP-date header", () => {
+    const result = MessageV2.fromError(
+      new LLMError({
+        module: "RequestExecutor",
+        method: "execute",
+        reason: new RateLimitReason({
+          message: "Provider request failed with HTTP 429",
+          retryAfterMs: 4_500,
+          http: new HttpContext({
+            request: new HttpRequestDetails({ method: "POST", url: "https://provider.test/v1/chat", headers: {} }),
+            response: new HttpResponseDetails({
+              status: 429,
+              headers: { "retry-after": "Fri, 02 Jan 2026 03:04:09 GMT" },
+            }),
+          }),
+        }),
+      }),
+      { providerID },
+    )
+
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(SessionRetry.delay(1, result, 0)).toBe(4_500)
+  })
+
+  test("invents no retry hint for a native LLM error without an HTTP exchange", () => {
+    const result = MessageV2.fromError(
+      new LLMError({
+        module: "RequestExecutor",
+        method: "execute",
+        reason: new TransportReason({ message: "HTTP transport failed", kind: "TransportError" }),
+      }),
+      { providerID },
+    )
+
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.statusCode).toBeUndefined()
+    expect(result.data.responseHeaders).toBeUndefined()
+    expect(SessionRetry.delay(1, result, 0)).toBe(2_000)
   })
 })
