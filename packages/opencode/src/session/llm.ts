@@ -17,8 +17,6 @@ import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
-import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventV2 } from "@opencode-ai/core/event"
 import { Wildcard } from "@/util/wildcard"
 import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
@@ -68,7 +66,6 @@ const live: Layer.Layer<
   | Provider.Service
   | Plugin.Service
   | Permission.Service
-  | EventV2Bridge.Service
   | LLMClientService
   | RuntimeFlags.Service
 > = Layer.effect(
@@ -79,7 +76,6 @@ const live: Layer.Layer<
     const provider = yield* Provider.Service
     const plugin = yield* Plugin.Service
     const perm = yield* Permission.Service
-    const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
 
@@ -113,16 +109,13 @@ const live: Layer.Layer<
         isWorkflow,
       })
 
+      const workflowModel = isWorkflow ? createWorkflowModelFacade(language) : undefined
+
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
       // and results sent back over the WebSocket.
       const bridge = yield* EffectBridge.make()
-      if (language instanceof GitLabWorkflowLanguageModel) {
-        const workflowModel = language as GitLabWorkflowLanguageModel & {
-          sessionID?: string
-          sessionPreapprovedTools?: string[]
-          approvalHandler?: (approvalTools: { name: string; args: string }[]) => Promise<{ approved: boolean }>
-        }
+      if (workflowModel) {
         workflowModel.sessionID = input.sessionID
         workflowModel.systemPrompt = prepared.system.join("\n")
         workflowModel.toolExecutor = async (toolName, argsJson, _requestID) => {
@@ -162,46 +155,21 @@ const live: Layer.Layer<
             return { approved: true }
           }
 
-          const id = PermissionV1.ID.ascending()
-          let unsub: EventV2.Unsubscribe | undefined
           try {
-            unsub = await bridge.promise(
-              events.listen((event) => {
-                if (event.type !== Permission.Event.Replied.type) return Effect.void
-                const data = event.data as EventV2.Data<typeof Permission.Event.Replied>
-                if (data.requestID !== id) return Effect.void
-                void data.reply
-                return Effect.void
+            const approval = await bridge.promise(
+              waitForWorkflowToolApproval({
+                permission: perm,
+                abort: input.abort,
+                sessionID: input.sessionID,
+                tools: approvalTools,
               }),
             )
-            const toolPatterns = approvalTools.map((t: { name: string; args: string }) => {
-              try {
-                const parsed = JSON.parse(t.args) as Record<string, unknown>
-                const title = (parsed?.title ?? parsed?.name ?? "") as string
-                return title ? `${t.name}: ${title}` : t.name
-              } catch {
-                return t.name
-              }
-            })
-            const uniquePatterns = [...new Set(toolPatterns)] as string[]
-            await bridge.promise(
-              perm.ask({
-                id,
-                sessionID: SessionID.make(input.sessionID),
-                permission: "workflow_tool_approval",
-                patterns: uniquePatterns,
-                metadata: { tools: approvalTools },
-                always: uniquePatterns,
-                ruleset: [],
-              }),
-            )
+            if (!approval.approved) return approval
             for (const name of uniqueNames) approvedToolsForSession.add(name)
             workflowModel.sessionPreapprovedTools = [...(workflowModel.sessionPreapprovedTools ?? []), ...uniqueNames]
-            return { approved: true }
+            return approval
           } catch {
             return { approved: false }
-          } finally {
-            if (unsub) await bridge.promise(unsub)
           }
         })
       }
@@ -324,7 +292,7 @@ const live: Layer.Layer<
           maxRetries: input.retries ?? 0,
           messages: prepared.messages,
           model: wrapLanguageModel({
-            model: language,
+            model: workflowModel ?? language,
             middleware: [
               {
                 specificationVersion: "v3" as const,
@@ -385,6 +353,106 @@ const live: Layer.Layer<
   }),
 )
 
+// One vendor model instance backs every session: `Provider.getLanguage` memoizes it
+// per provider/model, and the model itself is built to be shared — it keys DWS
+// workflows by session in `sessionWorkflows` and tracks every live client in
+// `activeClients`. Only the values the host rewrites per stream are the exception, so
+// they live on this facade rather than on the shared instance. `doStream` snapshots
+// `sessionID`, `toolExecutor`, and `sessionPreapprovedTools` at entry and the approval
+// path reads `workflowOptions.approvalHandler` live, so two interleaved sessions would
+// otherwise run each other's tools, prompt, and permission requests.
+//
+// Both traps pass the facade as the receiver. That is what makes the vendor's
+// prototype accessors resolve against request state — `toolExecutor` writes
+// `this._toolExecutor`, `systemPrompt` and `approvalHandler` write through
+// `this.workflowOptions` — while an ordinary cache write such as
+// `this.detectedProjectPath` still lands on the shared instance.
+//
+// Only `[[Get]]` and `[[Set]]` are trapped, so a descriptor read still reports the
+// shared instance's value. Nothing in the vendor, `wrapLanguageModel`, or `streamText`
+// reads descriptors; anything that does — `Object.freeze`, `structuredClone` — needs a
+// trap of its own.
+export function createWorkflowModelFacade<T extends GitLabWorkflowLanguageModel>(model: T): T {
+  // `workflowOptions` is `private` in the vendor types, but it is the object both the
+  // `systemPrompt` and `approvalHandler` setters write through, so the facade needs
+  // its own copy. `onUsageUpdate` and `onSelectModel` are documented per-stream host
+  // callbacks that nothing sets yet; they are listed so wiring one up later cannot
+  // quietly reintroduce the sharing this facade exists to prevent. The rest are seeded
+  // with the vendor's own defaults so a facade starts where a fresh instance would.
+  const shared = model as unknown as { readonly workflowOptions: Record<string, unknown> }
+  const request = new Map<PropertyKey, unknown>([
+    ["sessionID", ""],
+    ["sessionPreapprovedTools", []],
+    ["_toolExecutor", null],
+    ["onUsageUpdate", null],
+    ["onSelectModel", null],
+    ["workflowOptions", { ...shared.workflowOptions }],
+  ])
+
+  return new Proxy(model, {
+    get: (target, property, facade) =>
+      request.has(property) ? request.get(property) : Reflect.get(target, property, facade),
+    set: (target, property, value, facade) => {
+      if (!request.has(property)) return Reflect.set(target, property, value, facade)
+      request.set(property, value)
+      return true
+    },
+  })
+}
+
+// `Permission.ask` removes a pending request when interrupted. Keeping the abort race
+// in the same Effect ensures that finalizer runs before the workflow sees a rejection.
+// The permission service is passed in rather than yielded from context. This runs
+// through `EffectBridge.promise`, which erases requirements with a cast, so an ambient
+// service would resolve only as long as the captured context happened to carry it —
+// and getting that wrong would surface at runtime instead of failing to compile.
+export function waitForWorkflowToolApproval(input: {
+  permission: Permission.Interface
+  abort: AbortSignal
+  sessionID: string
+  tools: ReadonlyArray<{ name: string; args: string }>
+}) {
+  return Effect.gen(function* () {
+    const patterns = [
+      ...new Set(
+        input.tools.map((tool) => {
+          try {
+            const parsed = JSON.parse(tool.args) as Record<string, unknown>
+            const title = (parsed?.title ?? parsed?.name ?? "") as string
+            return title ? `${tool.name}: ${title}` : tool.name
+          } catch {
+            return tool.name
+          }
+        }),
+      ),
+    ]
+
+    return yield* Effect.raceFirst(
+      input.permission
+        .ask({
+          id: PermissionV1.ID.ascending(),
+          sessionID: SessionID.make(input.sessionID),
+          permission: "workflow_tool_approval",
+          patterns,
+          metadata: { tools: input.tools },
+          always: patterns,
+          ruleset: [],
+        })
+        .pipe(Effect.as({ approved: true as const })),
+      waitForAbort(input.abort).pipe(Effect.as({ approved: false as const })),
+    )
+  })
+}
+
+function waitForAbort(signal: AbortSignal) {
+  return Effect.callback<void>((resume) => {
+    if (signal.aborted) return resume(Effect.void)
+    const onAbort = () => resume(Effect.void)
+    signal.addEventListener("abort", onAbort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", onAbort))
+  })
+}
+
 export const hasToolCalls = LLMRequestPrep.hasToolCalls
 
 export const node = LayerNode.make({
@@ -396,7 +464,6 @@ export const node = LayerNode.make({
     Provider.node,
     Plugin.node,
     Permission.node,
-    EventV2Bridge.node,
     llmClient,
     RuntimeFlags.node,
   ],
