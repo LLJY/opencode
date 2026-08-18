@@ -139,13 +139,39 @@ export type ParsedStreamError =
       responseBody: string
     }
 
-export function parseStreamError(input: unknown): ParsedStreamError | undefined {
+function streamErrorBody(input: unknown) {
   const raw = json(input)
   const body = typeof raw?.message === "string" ? (json(raw.message) ?? raw) : raw
+  if (!body || body.type !== "error") return undefined
+  return body
+}
+
+// A top-level `request_timeout` is a transport failure, not provider-authored
+// assistant output. Callers that own attempt state use this to attach replay
+// metadata before deciding whether retrying the turn is safe.
+export function streamTimeoutMessage(input: unknown) {
+  const body = streamErrorBody(input)
+  if (body?.code !== "request_timeout") return undefined
+  // An empty provider message must still resolve to a usable message, otherwise
+  // callers reading a falsy result would classify the timeout as unrecognized.
+  return typeof body.message === "string" && body.message !== "" ? body.message : "Request timed out."
+}
+
+export function parseStreamError(input: unknown): ParsedStreamError | undefined {
+  const body = streamErrorBody(input)
   if (!body) return
 
   const responseBody = JSON.stringify(body)
-  if (body.type !== "error") return
+
+  const timeout = streamTimeoutMessage(input)
+  if (timeout) {
+    return {
+      type: "api_error",
+      message: timeout,
+      isRetryable: true,
+      responseBody,
+    }
+  }
 
   switch (body?.error?.code) {
     case "context_length_exceeded":

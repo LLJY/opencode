@@ -15,19 +15,19 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import { selectTargets, targetName } from "./targets"
 
-const singleFlag = process.argv.includes("--single")
-const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
-const targetArgs = process.argv.filter((arg) => arg.startsWith("--target"))
-if (targetArgs.length > 1) throw new Error("Build target may be specified only once")
-const targetArg = targetArgs[0]
-if (targetArg && !targetArg.startsWith("--target=")) throw new Error(`Invalid build target argument: ${targetArg}`)
-const targetFlag = targetArg?.slice("--target=".length)
-if (targetArg && !targetFlag) throw new Error("Build target must not be empty")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+// Resolved before any building so a bad --target still fails immediately.
+const targets = selectTargets({
+  name: pkg.name,
+  args: process.argv,
+  platform: process.platform,
+  arch: process.arch,
+})
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -56,105 +56,6 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
-const allTargets: {
-  os: string
-  arch: "arm64" | "x64"
-  abi?: "musl"
-  avx2?: false
-}[] = [
-  {
-    os: "linux",
-    arch: "arm64",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    avx2: false,
-  },
-  {
-    os: "linux",
-    arch: "arm64",
-    abi: "musl",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    abi: "musl",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    abi: "musl",
-    avx2: false,
-  },
-  {
-    os: "darwin",
-    arch: "arm64",
-  },
-  {
-    os: "darwin",
-    arch: "x64",
-  },
-  {
-    os: "darwin",
-    arch: "x64",
-    avx2: false,
-  },
-  {
-    os: "win32",
-    arch: "arm64",
-  },
-  {
-    os: "win32",
-    arch: "x64",
-  },
-  {
-    os: "win32",
-    arch: "x64",
-    avx2: false,
-  },
-]
-
-const targetName = (item: (typeof allTargets)[number]) =>
-  [
-    pkg.name,
-    item.os === "win32" ? "windows" : item.os,
-    item.arch,
-    item.avx2 === false ? "baseline" : undefined,
-    item.abi === undefined ? undefined : item.abi,
-  ]
-    .filter(Boolean)
-    .join("-")
-
-const targets = (() => {
-  if (targetFlag) return allTargets.filter((item) => targetName(item).slice(`${pkg.name}-`.length) === targetFlag)
-  if (!singleFlag) return allTargets
-  return allTargets.filter((item) => {
-    if (item.os !== process.platform || item.arch !== process.arch) {
-      return false
-    }
-
-    // When building for the current platform, prefer a single native binary by default.
-    // Baseline binaries require additional Bun artifacts and can be flaky to download.
-    if (item.avx2 === false) {
-      return baselineFlag
-    }
-
-    // also skip abi-specific builds for the same reason
-    if (item.abi !== undefined) {
-      return false
-    }
-
-    return true
-  })
-})()
-
-if (targets.length === 0) throw new Error(`Unknown or unavailable build target: ${targetFlag ?? "native"}`)
-
 await $`rm -rf dist`
 
 const binaries: Record<string, string> = {}
@@ -164,7 +65,7 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
 }
 for (const item of targets) {
-  const name = targetName(item)
+  const name = targetName(pkg.name, item)
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
 
