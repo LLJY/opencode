@@ -163,7 +163,11 @@ describe("plugin.openai.ws", () => {
   test("leaves completed idle sockets with a safe error listener", async () => {
     const socket = new (class extends EventEmitter {
       send(_data: string, callback: (error?: Error) => void) {
-        this.emit("message", Buffer.from(JSON.stringify({ type: "response.completed", response: { id: "resp_123" } })), false)
+        this.emit(
+          "message",
+          Buffer.from(JSON.stringify({ type: "response.completed", response: { id: "resp_123" } })),
+          false,
+        )
         callback()
       }
       terminate() {}
@@ -554,7 +558,9 @@ describe("plugin.openai.ws", () => {
       onConnectionInvalid: (error) => invalid.push(error),
     })
 
-    expect((await readTextError(response.text())).message).toContain("Upstream websocket closed before response.completed")
+    expect((await readTextError(response.text())).message).toContain(
+      "Upstream websocket closed before response.completed",
+    )
     expect(terminal.map((event) => event.type)).toEqual(["error"])
     expect(invalid[0]?.info).toEqual({
       transport: "websocket",
@@ -1264,7 +1270,9 @@ describe("plugin.openai.ws-pool", () => {
     const first = await fetch(server.url, streamRequest())
     expect((await readTextError(first.text())).message).toContain("Upstream websocket closed before response.completed")
     const second = await fetch(server.url, streamRequest())
-    expect((await readTextError(second.text())).message).toContain("Upstream websocket closed before response.completed")
+    expect((await readTextError(second.text())).message).toContain(
+      "Upstream websocket closed before response.completed",
+    )
     const third = await fetch(server.url, streamRequest())
     expect((await readTextError(third.text())).message).toContain("Upstream websocket closed before response.completed")
     expect(connections).toBe(3)

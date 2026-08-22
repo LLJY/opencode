@@ -101,9 +101,7 @@ export const promptCacheOptions = (request: LLMRequest): OpenAIPromptCacheOption
       ? (input.mode as OpenAIPromptCacheMode)
       : undefined
   const ttl =
-    typeof input.ttl === "string" && PROMPT_CACHE_TTLS.has(input.ttl)
-      ? (input.ttl as OpenAIPromptCacheTTL)
-      : undefined
+    typeof input.ttl === "string" && PROMPT_CACHE_TTLS.has(input.ttl) ? (input.ttl as OpenAIPromptCacheTTL) : undefined
   if (!mode && !ttl) return undefined
   return { mode, ttl }
 }
