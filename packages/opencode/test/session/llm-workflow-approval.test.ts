@@ -33,7 +33,9 @@ const cleared = (id: PermissionV1.ID) =>
   Effect.gen(function* () {
     const permission = yield* Permission.Service
     yield* pollWithTimeout(
-      permission.list().pipe(Effect.map((requests) => (requests.some((request) => request.id === id) ? undefined : true))),
+      permission
+        .list()
+        .pipe(Effect.map((requests) => (requests.some((request) => request.id === id) ? undefined : true))),
       `timed out waiting for ${id} workflow approval to clear`,
     )
   })
@@ -65,9 +67,7 @@ describe("session.llm workflow preapproval", () => {
     expect(
       LLM.workflowPreapprovedTools(["write", "apply_patch", "read_mcp_resource"], [rule("edit", "allow")]),
     ).toEqual(["write", "apply_patch"])
-    expect(LLM.workflowPreapprovedTools(["read_mcp_resource"], [rule("read", "allow")])).toEqual([
-      "read_mcp_resource",
-    ])
+    expect(LLM.workflowPreapprovedTools(["read_mcp_resource"], [rule("read", "allow")])).toEqual(["read_mcp_resource"])
   })
 
   test("keeps the last matching rule authoritative", () => {
