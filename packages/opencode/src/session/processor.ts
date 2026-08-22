@@ -217,7 +217,7 @@ const layer = Layer.effect(
         })
 
       const refreshCancelledByUser = Effect.fn("SessionProcessor.refreshCancelledByUser")(function* () {
-        cancelledByUser = cancelledByUser || (yield* (input.wasCancelled ?? Effect.succeed(false)))
+        cancelledByUser = cancelledByUser || (yield* input.wasCancelled ?? Effect.succeed(false))
         return cancelledByUser
       })
 
@@ -319,9 +319,13 @@ const layer = Layer.effect(
         if (error instanceof ProviderError.ResponseStreamError) return error
         const message = nativeOpenAIResponseStreamMessage(error)
         if (!message) return undefined
-        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)), {
-          cause: error,
-        })
+        return new ProviderError.ResponseStreamError(
+          message,
+          currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)),
+          {
+            cause: error,
+          },
+        )
       }
 
       function normalizeJsonParseResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
@@ -696,7 +700,9 @@ const layer = Layer.effect(
               throw new ProviderError.ResponseStreamError(value.message, streamInfo)
             }
             const error = new Error(value.message)
-            throw value.retryable === true ? (normalizeRetryableProviderStreamError(value.message, error) ?? error) : error
+            throw value.retryable === true
+              ? (normalizeRetryableProviderStreamError(value.message, error) ?? error)
+              : error
           }
 
           case "step-start":
@@ -745,7 +751,10 @@ const layer = Layer.effect(
             rememberAttemptPart(stepFinishID)
             yield* session.updateMessage(ctx.assistantMessage)
             if (emptyResponse) {
-              yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error: ctx.assistantMessage.error })
+              yield* events.publish(Session.Event.Error, {
+                sessionID: ctx.sessionID,
+                error: ctx.assistantMessage.error,
+              })
             }
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
@@ -1079,10 +1088,12 @@ const layer = Layer.effect(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
             ),
-            Effect.catchIf(() => true, (error) =>
-              Effect.gen(function* () {
-                return yield* Effect.fail(yield* recoverRetryableError(error))
-              }),
+            Effect.catchIf(
+              () => true,
+              (error) =>
+                Effect.gen(function* () {
+                  return yield* Effect.fail(yield* recoverRetryableError(error))
+                }),
             ),
             Effect.catchIf(
               (error) => error instanceof ResumeFromPromptLoop,

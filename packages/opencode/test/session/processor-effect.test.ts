@@ -230,10 +230,7 @@ const postToolRecoveryEnv = LayerNode.compile(
   [...replacements, [LLM.node, postToolRecoveryLLMLayer()]],
 )
 
-function processorLayer(
-  llmLayer: Layer.Layer<LLM.Service>,
-  sessionLayer?: Layer.Layer<Session.Service>,
-) {
+function processorLayer(llmLayer: Layer.Layer<LLM.Service>, sessionLayer?: Layer.Layer<Session.Service>) {
   if (sessionLayer) {
     return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer], [Session.node, sessionLayer]])
   }
@@ -1090,9 +1087,9 @@ isolatedIt.live("session.processor effect tests rollback partial output before m
           expect(value).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-            "after",
-          ])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
           expect(handle.message.error).toBeUndefined()
         })
 
@@ -2040,9 +2037,9 @@ isolatedIt.live("session.processor effect tests rollback retryable stream_incomp
           expect(llm.calls).toBe(2)
           expect(states).toStrictEqual([1])
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-            "after",
-          ])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
           expect(handle.message.error).toBeUndefined()
         })
 
@@ -2113,9 +2110,9 @@ isolatedIt.live("session.processor effect tests rollback replay-aware transient 
           expect(value).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-            "after",
-          ])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
           expect(handle.message.error).toBeUndefined()
         })
 
@@ -2258,9 +2255,9 @@ isolatedIt.live("session.processor effect tests do not replay arbitrary retryabl
           expect(llm.calls).toBe(1)
           expect(states).toStrictEqual([])
           expect(handle.message.error).toBeDefined()
-          expect(handle.message.error && "message" in handle.message.error.data ? handle.message.error.data.message : "").toContain(
-            "temporary provider failure",
-          )
+          expect(
+            handle.message.error && "message" in handle.message.error.data ? handle.message.error.data.message : "",
+          ).toContain("temporary provider failure")
         })
 
         yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
@@ -2423,9 +2420,9 @@ it.live("session.processor effect tests rollback assistant-only partial output b
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-        expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-          "after",
-        ])
+        expect(
+          parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+        ).toEqual(["after"])
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfgWithOptions(url, { chunkTimeout: 50 }) },
@@ -2501,9 +2498,9 @@ isolatedIt.live("session.processor effect tests rollback retryable websocket res
           expect(value).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-            "after",
-          ])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual(["after"])
           expect(handle.message.error).toBeUndefined()
         })
 
@@ -2513,98 +2510,108 @@ isolatedIt.live("session.processor effect tests rollback retryable websocket res
   ),
 )
 
-isolatedIt.live("session.processor effect tests rollback a completed assistant-only step before transient terminal retry", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.reasoningStart({ id: "reasoning_1" }),
-            LLMEvent.reasoningDelta({ id: "reasoning_1", text: "discarded reasoning" }),
-            LLMEvent.reasoningEnd({ id: "reasoning_1" }),
-            LLMEvent.textStart({ id: "text_1" }),
-            LLMEvent.textDelta({ id: "text_1", text: "discarded answer" }),
-            LLMEvent.textEnd({ id: "text_1" }),
-            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 } }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new ProviderError.ResponseStreamError("server_error: response failed after the completed step", {
-                  transport: "websocket",
-                  phase: "after_first_event",
-                  autoReplaySafe: false,
-                  retryable: true,
-                  terminalEvent: "response.failed",
-                }),
+isolatedIt.live(
+  "session.processor effect tests rollback a completed assistant-only step before transient terminal retry",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.reasoningStart({ id: "reasoning_1" }),
+              LLMEvent.reasoningDelta({ id: "reasoning_1", text: "discarded reasoning" }),
+              LLMEvent.reasoningEnd({ id: "reasoning_1" }),
+              LLMEvent.textStart({ id: "text_1" }),
+              LLMEvent.textDelta({ id: "text_1", text: "discarded answer" }),
+              LLMEvent.textEnd({ id: "text_1" }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "stop",
+                usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+              }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderError.ResponseStreamError("server_error: response failed after the completed step", {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: false,
+                    retryable: true,
+                    terminalEvent: "response.failed",
+                  }),
+                ),
               ),
             ),
-          ),
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.textStart({ id: "text_2" }),
-            LLMEvent.textDelta({ id: "text_2", text: "after" }),
-            LLMEvent.textEnd({ id: "text_2" }),
-            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }),
-            LLMEvent.finish({ reason: "stop", usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }),
-          ),
-        )
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.textStart({ id: "text_2" }),
+              LLMEvent.textDelta({ id: "text_2", text: "after" }),
+              LLMEvent.textEnd({ id: "text_2" }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "stop",
+                usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 },
+              }),
+              LLMEvent.finish({ reason: "stop", usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }),
+            ),
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry completed assistant-only step")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry completed assistant-only step")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry completed assistant-only step" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry completed assistant-only step" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+
+            expect(value).toBe("continue")
+            expect(llm.calls).toBe(2)
+            expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+            expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+            expect(parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")).toEqual([])
+            expect(
+              parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+            ).toEqual(["after"])
+            expect(handle.message.tokens).toEqual({
+              input: 5,
+              output: 7,
+              total: 12,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            })
+            expect(handle.message.error).toBeUndefined()
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-
-          expect(value).toBe("continue")
-          expect(llm.calls).toBe(2)
-          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")).toEqual([])
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
-            "after",
-          ])
-          expect(handle.message.tokens).toEqual({
-            input: 5,
-            output: 7,
-            total: 12,
-            reasoning: 0,
-            cache: { read: 0, write: 0 },
-          })
-          expect(handle.message.error).toBeUndefined()
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
 isolatedIt.live("session.processor effect tests do not replay a completed text plugin effect", () =>
@@ -2713,77 +2720,83 @@ isolatedIt.live("session.processor effect tests do not replay a completed text p
   ),
 )
 
-isolatedIt.live("session.processor effect tests do not retry a completed step with a deterministic empty-response error", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 } }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new ProviderError.ResponseStreamError("server_error: response failed after the empty step", {
-                  transport: "websocket",
-                  phase: "after_first_event",
-                  autoReplaySafe: false,
-                  retryable: true,
-                  terminalEvent: "response.failed",
-                }),
+isolatedIt.live(
+  "session.processor effect tests do not retry a completed step with a deterministic empty-response error",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "stop",
+                usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 },
+              }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderError.ResponseStreamError("server_error: response failed after the empty step", {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: false,
+                    retryable: true,
+                    terminalEvent: "response.failed",
+                  }),
+                ),
               ),
             ),
-          ),
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.textStart({ id: "text_2" }),
-            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
-            LLMEvent.textEnd({ id: "text_2" }),
-            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
-            LLMEvent.finish({ reason: "stop" }),
-          ),
-        )
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.textStart({ id: "text_2" }),
+              LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
+              LLMEvent.textEnd({ id: "text_2" }),
+              LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+              LLMEvent.finish({ reason: "stop" }),
+            ),
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "do not retry deterministic empty response")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "do not retry deterministic empty response")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "do not retry deterministic empty response" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "do not retry deterministic empty response" }],
+              tools: {},
+            })
+
+            expect(value).toBe("stop")
+            expect(llm.calls).toBe(1)
+            expect(SessionV1.EmptyResponseError.isInstance(handle.message.error)).toBe(true)
           })
 
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(SessionV1.EmptyResponseError.isInstance(handle.message.error)).toBe(true)
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
 for (const reason of ["content-filter", "error"] as const) {
@@ -3201,7 +3214,11 @@ isolatedIt.live("session.processor effect tests resume from rebuilt history afte
               name: "lookup",
               result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
             }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "tool-calls",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
             LLMEvent.stepStart({ index: 1 }),
             LLMEvent.textStart({ id: "text_1" }),
             LLMEvent.textDelta({ id: "text_1", text: "partial" }),
@@ -3276,7 +3293,9 @@ isolatedIt.live("session.processor effect tests resume from rebuilt history afte
           expect(resumedValue).toBe("continue")
           expect(llm.calls).toBe(2)
           expect(firstParts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(firstParts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
+          expect(
+            firstParts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual([])
           expect(resumedParts.filter((part) => part.type === "tool")).toHaveLength(0)
           expect(toolParts).toHaveLength(1)
           expect(toolParts[0]?.state.status).toBe("completed")
@@ -3303,7 +3322,11 @@ isolatedIt.live("session.processor effect tests do not resume unsafe response.fa
               name: "lookup",
               result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
             }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "tool-calls",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
             LLMEvent.stepStart({ index: 1 }),
             LLMEvent.textStart({ id: "text_1" }),
             LLMEvent.textDelta({ id: "text_1", text: "partial" }),
@@ -3370,216 +3393,226 @@ isolatedIt.live("session.processor effect tests do not resume unsafe response.fa
   ),
 )
 
-isolatedIt.live("session.processor effect tests resume after a completed tool result and transient response.failed", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new ProviderError.ResponseStreamError("server_error: response failed after the completed tool", {
-                  transport: "websocket",
-                  phase: "after_first_event",
-                  autoReplaySafe: false,
-                  retryable: true,
-                  terminalEvent: "response.failed",
-                }),
+isolatedIt.live(
+  "session.processor effect tests resume after a completed tool result and transient response.failed",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderError.ResponseStreamError("server_error: response failed after the completed tool", {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: false,
+                    retryable: true,
+                    terminalEvent: "response.failed",
+                  }),
+                ),
               ),
             ),
-          ),
-        )
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry immediately after tool result")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry immediately after tool result")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry immediately after tool result" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry immediately after tool result" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+            const toolPart = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+            expect(value).toBe("resume")
+            expect(llm.calls).toBe(1)
+            expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+            expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
+            expect(
+              parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+            ).toEqual([])
+            expect(toolPart?.state.status).toBe("completed")
+            expect(handle.message.error).toBeUndefined()
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-          const toolPart = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
-
-          expect(value).toBe("resume")
-          expect(llm.calls).toBe(1)
-          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
-          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
-          expect(toolPart?.state.status).toBe("completed")
-          expect(handle.message.error).toBeUndefined()
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
-isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors after a completed tool boundary", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-          ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
-        )
+isolatedIt.live(
+  "session.processor effect tests do not retry plain-text rate limit errors after a completed tool boundary",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+            ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry plain text after tool result")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry plain text after tool result")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry plain text after tool result" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry plain text after tool result" }],
+              tools: {},
+            })
+
+            expect(value).toBe("resume")
+            expect(llm.calls).toBe(1)
+            expect(handle.message.error).toBeUndefined()
           })
 
-          expect(value).toBe("resume")
-          expect(llm.calls).toBe(1)
-          expect(handle.message.error).toBeUndefined()
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
-isolatedIt.live("session.processor effect tests resume immediately after a completed tool result on retryable HTTP failure", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new APICallError({
-                  message: "boom",
-                  url: "https://example.com/v1/chat/completions",
-                  requestBodyValues: {},
-                  statusCode: 500,
-                  responseHeaders: { "content-type": "application/json" },
-                  responseBody: '{"error":"boom"}',
-                  isRetryable: true,
-                }),
+isolatedIt.live(
+  "session.processor effect tests resume immediately after a completed tool result on retryable HTTP failure",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new APICallError({
+                    message: "boom",
+                    url: "https://example.com/v1/chat/completions",
+                    requestBodyValues: {},
+                    statusCode: 500,
+                    responseHeaders: { "content-type": "application/json" },
+                    responseBody: '{"error":"boom"}',
+                    isRetryable: true,
+                  }),
+                ),
               ),
             ),
-          ),
-        )
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry http after tool result")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry http after tool result")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry http after tool result" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry http after tool result" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+            const toolPart = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+            expect(value).toBe("resume")
+            expect(llm.calls).toBe(1)
+            expect(toolPart?.state.status).toBe("completed")
+            expect(
+              parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+            ).toEqual([])
+            expect(handle.message.error).toBeUndefined()
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-          const toolPart = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
-
-          expect(value).toBe("resume")
-          expect(llm.calls).toBe(1)
-          expect(toolPart?.state.status).toBe("completed")
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
-          expect(handle.message.error).toBeUndefined()
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
 isolatedIt.live("session.processor effect tests resume after post-finish tool results", () =>
@@ -3591,7 +3624,11 @@ isolatedIt.live("session.processor effect tests resume after post-finish tool re
           Stream.make(
             LLMEvent.stepStart({ index: 0 }),
             LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "tool-calls",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
             LLMEvent.toolResult({
               id: "call_1",
               name: "lookup",
@@ -3616,7 +3653,11 @@ isolatedIt.live("session.processor effect tests resume after post-finish tool re
             LLMEvent.textStart({ id: "text_2" }),
             LLMEvent.textDelta({ id: "text_2", text: "after" }),
             LLMEvent.textEnd({ id: "text_2" }),
-            LLMEvent.stepFinish({ index: 1, reason: "stop", usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 } }),
+            LLMEvent.stepFinish({
+              index: 1,
+              reason: "stop",
+              usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 },
+            }),
             LLMEvent.finish({ reason: "stop", usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 } }),
           ),
         )
@@ -3655,7 +3696,9 @@ isolatedIt.live("session.processor effect tests resume after post-finish tool re
 
           expect(value).toBe("resume")
           expect(llm.calls).toBe(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual([])
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
           expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
           expect(handle.message.error).toBeUndefined()
@@ -3739,77 +3782,79 @@ isolatedIt.live("session.processor effect tests stop when committed-boundary rol
 // Nothing restores a part once its removal committed, so a failure partway through the
 // rollback must not abandon the removals behind it: the reasoning part is the one that
 // cannot be removed, and the step-start queued after it still has to go.
-isolatedIt.live("session.processor effect tests remove the rest of an attempt when a later rollback removal fails", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.reasoningStart({ id: "reasoning_1" }),
-            LLMEvent.reasoningDelta({ id: "reasoning_1", text: "thinking" }),
-            LLMEvent.textStart({ id: "text_1" }),
-            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new JSONParseError({
-                  text: '{"type":"response.output_text.delta"',
-                  cause: new SyntaxError("Unexpected end of JSON input"),
-                }),
+isolatedIt.live(
+  "session.processor effect tests remove the rest of an attempt when a later rollback removal fails",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.reasoningStart({ id: "reasoning_1" }),
+              LLMEvent.reasoningDelta({ id: "reasoning_1", text: "thinking" }),
+              LLMEvent.textStart({ id: "text_1" }),
+              LLMEvent.textDelta({ id: "text_1", text: "partial" }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new JSONParseError({
+                    text: '{"type":"response.output_text.delta"',
+                    cause: new SyntaxError("Unexpected end of JSON input"),
+                  }),
+                ),
               ),
             ),
-          ),
-        )
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "rollback failure partway through the attempt")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "rollback failure partway through the attempt")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "rollback failure partway through the attempt" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "rollback failure partway through the attempt" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+
+            expect(value).toBe("stop")
+            expect(llm.calls).toBe(1)
+            expect(handle.message.error).toBeDefined()
+            // Removal runs newest first, so the reasoning part is the second of three and
+            // the step-start behind it is the one an aborted loop would strand. Halting
+            // re-persists the in-flight text and reasoning parts, so the step-start is
+            // what the assertion turns on.
+            expect(parts.map((part) => part.type)).toEqual(["reasoning", "text"])
+            expect(parts.some((part) => part.type === "step-start")).toBe(false)
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(handle.message.error).toBeDefined()
-          // Removal runs newest first, so the reasoning part is the second of three and
-          // the step-start behind it is the one an aborted loop would strand. Halting
-          // re-persists the in-flight text and reasoning parts, so the step-start is
-          // what the assertion turns on.
-          expect(parts.map((part) => part.type)).toEqual(["reasoning", "text"])
-          expect(parts.some((part) => part.type === "step-start")).toBe(false)
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer(1))))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer(1))))
+        }),
+      { config: cfg },
+    ),
 )
 
 isolatedIt.live("session.processor effect tests stop when model-only JSON rollback fails", () =>
@@ -4026,7 +4071,9 @@ isolatedIt.live("session.processor effect tests resume after a durable tool erro
           expect(llm.calls).toBe(1)
           expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
           expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
-          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
+          expect(
+            parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
+          ).toEqual([])
           expect(toolPart?.state.status).toBe("error")
           expect(handle.message.error).toBeUndefined()
         })
@@ -4037,182 +4084,194 @@ isolatedIt.live("session.processor effect tests resume after a durable tool erro
   ),
 )
 
-isolatedIt.live("session.processor effect tests do not resume when a new tool step is in flight after a committed boundary", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
-            LLMEvent.stepStart({ index: 1 }),
-            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
-                  transport: "websocket",
-                  phase: "after_first_event",
-                  autoReplaySafe: false,
-                }),
+isolatedIt.live(
+  "session.processor effect tests do not resume when a new tool step is in flight after a committed boundary",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "tool-calls",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              }),
+              LLMEvent.stepStart({ index: 1 }),
+              LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: false,
+                  }),
+                ),
               ),
             ),
-          ),
-        )
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry during new tool step")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry during new tool step")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry during new tool step" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry during new tool step" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+            const completed = parts.find(
+              (part): part is SessionV1.ToolPart =>
+                part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
+            )
+            const interrupted = parts.find(
+              (part): part is SessionV1.ToolPart =>
+                part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
+            )
+
+            expect(value).toBe("stop")
+            expect(llm.calls).toBe(1)
+            expect(completed?.state.status).toBe("completed")
+            expect(interrupted?.state.status).toBe("error")
+            if (interrupted?.state.status === "error") {
+              expect(interrupted.state.error).toBe("Tool execution aborted")
+              expect(interrupted.state.metadata?.interrupted).toBe(true)
+            }
+            expect(handle.message.error).toBeDefined()
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-          const completed = parts.find(
-            (part): part is SessionV1.ToolPart =>
-              part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
-          )
-          const interrupted = parts.find(
-            (part): part is SessionV1.ToolPart =>
-              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
-          )
-
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(completed?.state.status).toBe("completed")
-          expect(interrupted?.state.status).toBe("error")
-          if (interrupted?.state.status === "error") {
-            expect(interrupted.state.error).toBe("Tool execution aborted")
-            expect(interrupted.state.metadata?.interrupted).toBe(true)
-          }
-          expect(handle.message.error).toBeDefined()
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
-isolatedIt.live("session.processor effect tests do not retry API failures during a new tool step after a committed boundary", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
-            LLMEvent.stepStart({ index: 1 }),
-            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new APICallError({
-                  message: "boom",
-                  url: "https://example.com/v1/chat/completions",
-                  requestBodyValues: {},
-                  statusCode: 500,
-                  responseHeaders: { "content-type": "application/json" },
-                  responseBody: '{"error":"boom"}',
-                  isRetryable: true,
-                }),
+isolatedIt.live(
+  "session.processor effect tests do not retry API failures during a new tool step after a committed boundary",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "tool-calls",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              }),
+              LLMEvent.stepStart({ index: 1 }),
+              LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new APICallError({
+                    message: "boom",
+                    url: "https://example.com/v1/chat/completions",
+                    requestBodyValues: {},
+                    statusCode: 500,
+                    responseHeaders: { "content-type": "application/json" },
+                    responseBody: '{"error":"boom"}',
+                    isRetryable: true,
+                  }),
+                ),
               ),
             ),
-          ),
-        )
+          )
 
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry api during new tool step")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry api during new tool step")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
               sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry api during new tool step" }],
-            tools: {},
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry api during new tool step" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+            const completed = parts.find(
+              (part): part is SessionV1.ToolPart =>
+                part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
+            )
+            const interrupted = parts.find(
+              (part): part is SessionV1.ToolPart =>
+                part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
+            )
+
+            expect(value).toBe("stop")
+            expect(llm.calls).toBe(1)
+            expect(completed?.state.status).toBe("completed")
+            expect(interrupted?.state.status).toBe("error")
+            if (interrupted?.state.status === "error") {
+              expect(interrupted.state.error).toBe("Tool execution aborted")
+              expect(interrupted.state.metadata?.interrupted).toBe(true)
+            }
+            expect(handle.message.error?.name).toBe("APIError")
           })
 
-          const parts = yield* MessageV2.parts(msg.id)
-          const completed = parts.find(
-            (part): part is SessionV1.ToolPart =>
-              part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
-          )
-          const interrupted = parts.find(
-            (part): part is SessionV1.ToolPart =>
-              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
-          )
-
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(completed?.state.status).toBe("completed")
-          expect(interrupted?.state.status).toBe("error")
-          if (interrupted?.state.status === "error") {
-            expect(interrupted.state.error).toBe("Tool execution aborted")
-            expect(interrupted.state.metadata?.interrupted).toBe(true)
-          }
-          expect(handle.message.error?.name).toBe("APIError")
-        })
-
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
 isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors during a new tool step", () =>
@@ -4229,7 +4288,11 @@ isolatedIt.live("session.processor effect tests do not retry plain-text rate lim
               name: "lookup",
               result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
             }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "tool-calls",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
             LLMEvent.stepStart({ index: 1 }),
             LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
           ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
@@ -4276,88 +4339,94 @@ isolatedIt.live("session.processor effect tests do not retry plain-text rate lim
   ),
 )
 
-isolatedIt.live("session.processor effect tests stop after denied tool boundary even when a retryable failure follows", () =>
-  provideTmpdirInstance(
-    (dir) =>
-      Effect.gen(function* () {
-        const llm = llmStub()
-        llm.push(
-          Stream.make(
-            LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
-            LLMEvent.toolResult({
-              id: "call_1",
-              name: "lookup",
-              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
-            }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
-            LLMEvent.stepStart({ index: 1 }),
-            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
-            LLMEvent.toolError({
-              id: "call_2",
-              name: "lookup",
-              message: "permission denied",
-              error: new PermissionV1.RejectedError(),
-            }),
-          ).pipe(
-            Stream.concat(
-              Stream.fail(
-                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
-                  transport: "websocket",
-                  phase: "after_first_event",
-                  autoReplaySafe: false,
-                }),
+isolatedIt.live(
+  "session.processor effect tests stop after denied tool boundary even when a retryable failure follows",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const llm = llmStub()
+          llm.push(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
+              LLMEvent.toolResult({
+                id: "call_1",
+                name: "lookup",
+                result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
+              }),
+              LLMEvent.stepFinish({
+                index: 0,
+                reason: "tool-calls",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              }),
+              LLMEvent.stepStart({ index: 1 }),
+              LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
+              LLMEvent.toolError({
+                id: "call_2",
+                name: "lookup",
+                message: "permission denied",
+                error: new PermissionV1.RejectedError(),
+              }),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
+                    transport: "websocket",
+                    phase: "after_first_event",
+                    autoReplaySafe: false,
+                  }),
+                ),
               ),
             ),
-          ),
-        )
-
-        const effect = Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
-
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "retry after denied tool")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const value = yield* handle.process({
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies SessionV1.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "retry after denied tool" }],
-            tools: {},
-          })
-
-          const parts = yield* MessageV2.parts(msg.id)
-          const denied = parts.find(
-            (part): part is SessionV1.ToolPart =>
-              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
           )
 
-          expect(value).toBe("stop")
-          expect(llm.calls).toBe(1)
-          expect(denied?.state.status).toBe("error")
-          expect(handle.message.error).toBeUndefined()
-        })
+          const effect = Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
 
-        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-      }),
-    { config: cfg },
-  ),
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "retry after denied tool")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+            const handle = yield* processors.create({
+              assistantMessage: msg,
+              sessionID: chat.id,
+              model: mdl,
+            })
+
+            const value = yield* handle.process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "retry after denied tool" }],
+              tools: {},
+            })
+
+            const parts = yield* MessageV2.parts(msg.id)
+            const denied = parts.find(
+              (part): part is SessionV1.ToolPart =>
+                part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
+            )
+
+            expect(value).toBe("stop")
+            expect(llm.calls).toBe(1)
+            expect(denied?.state.status).toBe("error")
+            expect(handle.message.error).toBeUndefined()
+          })
+
+          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
+        }),
+      { config: cfg },
+    ),
 )
 
 isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors after a denied tool", () =>
@@ -4374,7 +4443,11 @@ isolatedIt.live("session.processor effect tests do not retry plain-text rate lim
               name: "lookup",
               result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
             }),
-            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: "tool-calls",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
             LLMEvent.stepStart({ index: 1 }),
             LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
             LLMEvent.toolError({
@@ -4590,10 +4663,7 @@ postToolRecoveryIt.live("session.processor effect tests stop after a tool failur
         let executions = 0
         const receivers: unknown[] = []
 
-        yield* llm.push(
-          reply().tool("lookup", { query: "weather" }),
-          reply().tool("lookup", { query: "weather" }),
-        )
+        yield* llm.push(reply().tool("lookup", { query: "weather" }), reply().tool("lookup", { query: "weather" }))
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "recover after one real tool execution")

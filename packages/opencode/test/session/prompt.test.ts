@@ -972,7 +972,9 @@ it.instance("loop continues after a retryable follow-up HTTP failure without re-
 
     const result = yield* prompt.loop({ sessionID: session.id })
     const msgs = yield* MessageV2.filterCompactedEffect(session.id)
-    const toolParts = msgs.flatMap((msg) => msg.parts).filter((part): part is SessionV1.ToolPart => part.type === "tool")
+    const toolParts = msgs
+      .flatMap((msg) => msg.parts)
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool")
 
     expect(yield* llm.calls).toBe(3)
     expect(result.info.role).toBe("assistant")

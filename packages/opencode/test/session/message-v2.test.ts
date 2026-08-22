@@ -1106,7 +1106,9 @@ describe("session.message-v2.toModelMessage", () => {
     const input: SessionV1.WithParts[] = [
       {
         info: userInfo(userID),
-        parts: [{ ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" }] as SessionV1.Part[],
+        parts: [
+          { ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" },
+        ] as SessionV1.Part[],
       },
       {
         info: assistantInfo(assistantID, userID, aborted),
@@ -1728,9 +1730,12 @@ describe("session.message-v2.fromError", () => {
   })
 
   test("classifies exact header timeout as retryable APIError without user cancellation", () => {
-    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
-      providerID,
-    })
+    const result = MessageV2.fromError(
+      new DOMException("Provider response headers timed out after 10000ms", "AbortError"),
+      {
+        providerID,
+      },
+    )
 
     expect(SessionV1.APIError.isInstance(result)).toBe(true)
     expect((result as SessionV1.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
@@ -1742,10 +1747,13 @@ describe("session.message-v2.fromError", () => {
   })
 
   test("classifies exact abort-shaped header timeout as AbortedError with user cancellation", () => {
-    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
-      providerID,
-      userCancelled: true,
-    })
+    const result = MessageV2.fromError(
+      new DOMException("Provider response headers timed out after 10000ms", "AbortError"),
+      {
+        providerID,
+        userCancelled: true,
+      },
+    )
 
     expect(SessionV1.AbortedError.isInstance(result)).toBe(true)
     if (!SessionV1.AbortedError.isInstance(result)) throw new Error("expected aborted error")

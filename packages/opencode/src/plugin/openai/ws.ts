@@ -265,9 +265,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       }
       failTerminal(
         event,
-        retryableHttpStatus(wrappedError.status)
-          ? failure(wrappedError.message, error, { retryable: true })
-          : error,
+        retryableHttpStatus(wrappedError.status) ? failure(wrappedError.message, error, { retryable: true }) : error,
       )
       return
     }

@@ -568,13 +568,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
       ProviderTransform.options({ model: createGpt5Model(id), sessionID, providerOptions: {} }),
     )
 
-    expect(options.map((item) => item.promptCacheKey)).toEqual([
-      sessionID,
-      sessionID,
-      sessionID,
-      sessionID,
-      sessionID,
-    ])
+    expect(options.map((item) => item.promptCacheKey)).toEqual([sessionID, sessionID, sessionID, sessionID, sessionID])
     expect(options.every((item) => item.promptCacheOptions === undefined)).toBe(true)
   })
 
@@ -676,9 +670,9 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
       { role: "user", content: "Follow-up" },
       { role: "assistant", content: MAX_STEPS_PROMPT },
     ])
-    expect(result.messages.some((message) => message.role === "system" && message.content.includes("Stay concise"))).toBe(
-      true,
-    )
+    expect(
+      result.messages.some((message) => message.role === "system" && message.content.includes("Stay concise")),
+    ).toBe(true)
     expect(JSON.stringify(result.messages)).not.toContain("First turn")
     expect(JSON.stringify(result.messages)).not.toContain("First reply")
 

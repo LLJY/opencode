@@ -165,7 +165,8 @@ const scan = Effect.fnUntraced(function* (
     }),
   )
 
-  const filtered = opts?.symlink === false ? yield* Effect.filter(matches, (match) => isNotInSymlink(root, match)) : matches
+  const filtered =
+    opts?.symlink === false ? yield* Effect.filter(matches, (match) => isNotInSymlink(root, match)) : matches
 
   for (const match of filtered) {
     state.matches.add(match)

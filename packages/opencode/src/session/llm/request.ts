@@ -103,24 +103,21 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
   if (isOpenaiOauth) options.instructions = system.join("\n")
 
   const previousAssistant = previousResponseId
-    ? input.messages.findLastIndex(
-        (message) => message.role === "assistant" && message.content !== MAX_STEPS_PROMPT,
-      )
+    ? input.messages.findLastIndex((message) => message.role === "assistant" && message.content !== MAX_STEPS_PROMPT)
     : -1
-  const messages =
-    input.isWorkflow
-      ? input.messages
-      : [
-          ...(isOpenaiOauth
-            ? []
-            : system.map(
-                (x): ModelMessage => ({
-                  role: "system",
-                  content: x,
-                }),
-              )),
-          ...input.messages.slice(previousAssistant + 1),
-        ]
+  const messages = input.isWorkflow
+    ? input.messages
+    : [
+        ...(isOpenaiOauth
+          ? []
+          : system.map(
+              (x): ModelMessage => ({
+                role: "system",
+                content: x,
+              }),
+            )),
+        ...input.messages.slice(previousAssistant + 1),
+      ]
 
   const params = yield* input.plugin.trigger(
     "chat.params",

@@ -70,9 +70,9 @@ describe("McpRateLimit.delay", () => {
   // A parseable header is authoritative even when it asks for no wait, so it must not
   // hand control to a header the server ranked lower.
   test("a Retry-After of zero preempts reset headers", () => {
-    expect(
-      McpRateLimit.delay(new Headers({ "retry-after": "0", "ratelimit-reset": "9" }), 0, { now, random: 0 }),
-    ).toBe(500)
+    expect(McpRateLimit.delay(new Headers({ "retry-after": "0", "ratelimit-reset": "9" }), 0, { now, random: 0 })).toBe(
+      500,
+    )
     expect(
       McpRateLimit.delay(new Headers({ "retry-after": "0", "x-ratelimit-reset-after": "9" }), 1, { now, random: 0 }),
     ).toBe(1_000)
@@ -925,24 +925,28 @@ describe("McpRateLimit.RetryTransport", () => {
         ),
     })
     const endpoint = new URL("/sse", http.url)
-    const transport = new McpRateLimit.RetryTransport(endpoint, (fetch) => new SSEClientTransport(endpoint, { fetch }), {
-      // The handshake stays on the real server; only the message POST answers with a
-      // body whose cancel never settles.
-      fetch: (url, init) =>
-        init?.method === "POST"
-          ? Promise.resolve(
-              new Response(
-                new ReadableStream({
-                  cancel() {
-                    cancelled++
-                    return new Promise<void>(() => {})
-                  },
-                }),
-                { status: 200 },
-              ),
-            )
-          : fetch(url, init),
-    })
+    const transport = new McpRateLimit.RetryTransport(
+      endpoint,
+      (fetch) => new SSEClientTransport(endpoint, { fetch }),
+      {
+        // The handshake stays on the real server; only the message POST answers with a
+        // body whose cancel never settles.
+        fetch: (url, init) =>
+          init?.method === "POST"
+            ? Promise.resolve(
+                new Response(
+                  new ReadableStream({
+                    cancel() {
+                      cancelled++
+                      return new Promise<void>(() => {})
+                    },
+                  }),
+                  { status: 200 },
+                ),
+              )
+            : fetch(url, init),
+      },
+    )
 
     try {
       await transport.start()
@@ -1046,10 +1050,7 @@ describe("McpRateLimit.RetryTransport", () => {
     )
 
     try {
-      await transport.send(
-        { jsonrpc: "2.0", id: 1, method: "tools/call", params: {} },
-        { isRequestActive: () => true },
-      )
+      await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} }, { isRequestActive: () => true })
       expect(received).toHaveLength(40_960)
     } finally {
       await transport.close()

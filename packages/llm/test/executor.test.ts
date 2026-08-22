@@ -560,9 +560,7 @@ describe("RequestExecutor", () => {
       expect(errorHttp(error)?.body).toContain("<redact")
     }).pipe(
       Effect.provide(
-        responsesLayer([
-          new Response("x".repeat(16_376) + "query-secret-123" + "y".repeat(5_000), { status: 400 }),
-        ]),
+        responsesLayer([new Response("x".repeat(16_376) + "query-secret-123" + "y".repeat(5_000), { status: 400 })]),
       ),
     ),
   )
@@ -782,9 +780,7 @@ describe("RequestExecutor", () => {
     const echoed = "head-0123456789abcdef"
     const overlapping = "0123-xyz-token"
     const twoSecretRequest = HttpClientRequest.post("https://provider.test/v1/chat").pipe(
-      HttpClientRequest.setHeaders(
-        Headers.fromInput({ authorization: `Bearer ${overlapping}`, "x-api-key": echoed }),
-      ),
+      HttpClientRequest.setHeaders(Headers.fromInput({ authorization: `Bearer ${overlapping}`, "x-api-key": echoed })),
     )
     // Three-byte filler keeps the read at its byte budget while leaving the decoded
     // text far under the reported budget, so the repaired tail is actually reported

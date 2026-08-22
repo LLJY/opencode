@@ -722,10 +722,7 @@ describe("OpenAI Chat route", () => {
 
   it.effect("emits step-finish with stop even without finish_reason in stream", () =>
     Effect.gen(function* () {
-      const body = sseEvents(
-        deltaChunk({ role: "assistant", content: "Hello" }),
-        deltaChunk({ content: "!" }),
-      )
+      const body = sseEvents(deltaChunk({ role: "assistant", content: "Hello" }), deltaChunk({ content: "!" }))
       const events = Array.from(
         yield* LLMClient.stream(request).pipe(Stream.runCollect, Effect.provide(fixedResponse(body))),
       )

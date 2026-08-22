@@ -160,12 +160,7 @@ export class RetryTransport implements Transport {
 // the fetch runs on, so transport close and the caller's own abort still tear the
 // body down; this only extends them, and the SDK's request-active callback, past the
 // headers. Settling on either end also bounds the poll's lifetime.
-function watchBody(
-  response: Response,
-  source: NonNullable<Response["body"]>,
-  signal: AbortSignal,
-  stop: () => void,
-) {
+function watchBody(response: Response, source: NonNullable<Response["body"]>, signal: AbortSignal, stop: () => void) {
   const reader = source.getReader()
   let settled = false
   let abort: (() => void) | undefined

@@ -189,7 +189,7 @@ describe("SessionRunState", () => {
         expect(yield* queuedWasCancelled).toBe(true)
         expect(yield* Fiber.join(queued)).toBe(output)
         expect(yield* run.wasCancelled(sessionID)).toBe(false)
-        expect(yield* (yield* run.cancelProbe(sessionID))).toBe(false)
+        expect(yield* yield* run.cancelProbe(sessionID)).toBe(false)
       }).pipe(
         Effect.ensuring(
           Effect.all([Deferred.succeed(releaseShell, undefined), Deferred.succeed(releaseQueued, undefined)], {

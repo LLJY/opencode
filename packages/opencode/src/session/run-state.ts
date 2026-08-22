@@ -126,7 +126,9 @@ const layer = Layer.effect(
       switch (current.state._tag) {
         case "Idle": {
           const probe = installActiveProbe(data.cancelled, sessionID)
-          return yield* current.ensureRunning(work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))))
+          return yield* current.ensureRunning(
+            work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))),
+          )
         }
         case "Shell": {
           const probe = installQueuedProbe(data.cancelled, sessionID)
@@ -147,7 +149,9 @@ const layer = Layer.effect(
       const data = yield* InstanceState.get(state)
       const current = yield* runner(sessionID, onInterrupt)
       if (current.state._tag !== "Idle") {
-        return yield* current.startShell(work, ready).pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+        return yield* current
+          .startShell(work, ready)
+          .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
       }
       const probe = installActiveProbe(data.cancelled, sessionID)
       return yield* current
