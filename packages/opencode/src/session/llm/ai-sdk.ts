@@ -101,7 +101,14 @@ export function toLLMEvents(
 
     case "finish-step":
       if (event.rawFinishReason === "network_error")
-        return Effect.fail(new ProviderError.ResponseStreamError("Provider finish_reason: network_error"))
+        return Effect.fail(
+          new ProviderError.ResponseStreamError("Provider finish_reason: network_error", {
+            transport: "sse",
+            phase: "after_first_event",
+            autoReplaySafe: false,
+            retryable: true,
+          }),
+        )
       return Effect.sync(() => {
         const original = providerMetadata(event.providerMetadata)
         const metadata =
