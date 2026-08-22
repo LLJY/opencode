@@ -468,15 +468,7 @@ export const hasToolCalls = LLMRequestPrep.hasToolCalls
 export const node = LayerNode.make({
   service: Service,
   layer: live,
-  deps: [
-    Auth.node,
-    Config.node,
-    Provider.node,
-    Plugin.node,
-    Permission.node,
-    llmClient,
-    RuntimeFlags.node,
-  ],
+  deps: [Auth.node, Config.node, Provider.node, Plugin.node, Permission.node, llmClient, RuntimeFlags.node],
 })
 
 export * as LLM from "./llm"
