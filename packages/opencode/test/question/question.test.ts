@@ -119,6 +119,41 @@ it.instance(
   { git: true },
 )
 
+it.instance(
+  "ask - interruption publishes rejection so clients remove the pending question",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("ses_interrupted")
+      const events = yield* EventV2Bridge.Service
+      const rejected = yield* Queue.unbounded<QuestionID>()
+      const off = yield* events.listen((event) => {
+        if (event.type !== Question.Event.Rejected.type) return Effect.void
+        const data = event.data as typeof Question.Event.Rejected.data.Type
+        if (data.sessionID === sessionID) Queue.offerUnsafe(rejected, data.requestID)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const fiber = yield* askEffect({
+        sessionID,
+        questions: [
+          {
+            question: "Should this disappear?",
+            header: "Cleanup",
+            options: [{ label: "Yes", description: "Remove the stale dock" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      const [pending] = yield* waitForPending(1)
+      yield* Fiber.interrupt(fiber)
+
+      expect(yield* Queue.take(rejected).pipe(Effect.timeout("500 millis"))).toBe(pending.id)
+      expect(yield* listEffect).toEqual([])
+    }),
+  { git: true },
+)
+
 // reply tests
 
 it.instance(

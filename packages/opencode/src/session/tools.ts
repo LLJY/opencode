@@ -38,6 +38,16 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/webp",
 ])
 
+function interruptOnAbort(signal: AbortSignal | undefined) {
+  if (!signal) return Effect.never
+  return Effect.callback<never>((resume) => {
+    if (signal.aborted) return resume(Effect.interrupt)
+    const handler = () => resume(Effect.interrupt)
+    signal.addEventListener("abort", handler, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", handler))
+  })
+}
+
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
@@ -108,7 +118,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
               { args },
             )
-            const result = yield* item.execute(args, ctx)
+            const result = yield* item.id === "question"
+              ? Effect.raceFirst(item.execute(args, ctx), interruptOnAbort(options.abortSignal))
+              : item.execute(args, ctx)
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({

@@ -103,11 +103,24 @@ const layer = Layer.effect(
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
 
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* Deferred.await(deferred).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => pending.delete(id)).pipe(
+            Effect.flatMap((removed) =>
+              removed
+                ? events.publish(Event.Rejected, {
+                    sessionID: input.sessionID,
+                    requestID: id,
+                  })
+                : Effect.void,
+            ),
+          ),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.delete(id)
+          }),
+        ),
       )
     })
 

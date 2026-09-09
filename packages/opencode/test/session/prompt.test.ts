@@ -882,6 +882,57 @@ it.instance("loop continues when finish is tool-calls", () =>
   }),
 )
 
+it.instance("interrupted question tools notify clients and clear pending state", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const events = yield* EventV2Bridge.Service
+    const rejected = yield* Deferred.make<string>()
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const off = yield* events.listen((event) => {
+      if (event.type !== Question.Event.Rejected.type) return Effect.void
+      const data = event.data as typeof Question.Event.Rejected.data.Type
+      if (data.sessionID !== session.id) return Effect.void
+      return Deferred.succeed(rejected, data.requestID).pipe(Effect.asVoid)
+    })
+    yield* Effect.addFinalizer(() => off)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "ask me before continuing" }],
+    })
+    yield* llm.tool("question", {
+      questions: [
+        {
+          question: "Continue?",
+          header: "Confirm",
+          options: [{ label: "Yes", description: "Continue the task" }],
+        },
+      ],
+    })
+
+    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+    const pending = yield* pollWithTimeout(
+      question.list().pipe(Effect.map((items) => items[0])),
+      "question tool never became pending",
+      "2 seconds",
+    )
+
+    yield* prompt.cancel(session.id)
+    yield* Fiber.await(fiber)
+
+    expect(yield* question.list()).toEqual([])
+    expect(yield* Deferred.await(rejected).pipe(Effect.timeout("2 seconds"))).toBe(pending.id)
+  }),
+)
+
 it.instance("loop continues when finish is unknown", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
