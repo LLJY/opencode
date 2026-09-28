@@ -178,6 +178,86 @@ it.live("chunkTimeout fires while a stalled stream is kept warm by comment heart
   }),
 )
 
+it.live("CR-only SSE fields keep chunkTimeout alive across reads", () =>
+  Effect.gen(function* () {
+    yield* provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const provider = yield* Provider.Service
+          const configured = yield* provider.getProvider(ProviderV2.ID.make("test"))
+          const signals: AbortSignal[] = []
+          configured.options.fetch = (_: RequestInfo | URL, init?: RequestInit) => {
+            if (init?.signal) signals.push(init.signal)
+            const chunks = Array.from({ length: 8 }, (_, i) => `data: {"choices":[{"delta":{"content":"${i}"}}]}\r\r`)
+            chunks.push("data: [DONE]\r\r\n")
+            return Promise.resolve(
+              new Response(
+                new ReadableStream<Uint8Array>({
+                  async pull(ctrl) {
+                    await Bun.sleep(15)
+                    const chunk = chunks.shift()
+                    if (chunk === undefined) return ctrl.close()
+                    ctrl.enqueue(new TextEncoder().encode(chunk))
+                  },
+                }),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            )
+          }
+          const model = yield* provider.getModel(ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"))
+          const result = streamText({
+            model: yield* provider.getLanguage(model),
+            messages: [{ role: "user", content: "hello" }],
+          })
+          expect(yield* Effect.promise(() => result.text)).toBe("01234567")
+          expect(signals[0]?.aborted).toBe(false)
+        }),
+      { config: providerConfig("https://example.test", { chunkTimeout: 70 }) },
+    )
+  }),
+)
+
+it.live("a failed SSE read clears chunkTimeout without a later abort", () =>
+  Effect.gen(function* () {
+    yield* provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const provider = yield* Provider.Service
+          const configured = yield* provider.getProvider(ProviderV2.ID.make("test"))
+          const failure = new Error("upstream read failed")
+          const signals: AbortSignal[] = []
+          configured.options.fetch = (_: RequestInfo | URL, init?: RequestInit) => {
+            if (init?.signal) signals.push(init.signal)
+            return Promise.resolve(
+              new Response(
+                new ReadableStream<Uint8Array>({
+                  pull(ctrl) {
+                    ctrl.error(failure)
+                  },
+                }),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            )
+          }
+          const model = yield* provider.getModel(ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"))
+          const result = streamText({
+            model: yield* provider.getLanguage(model),
+            onError() {},
+            messages: [{ role: "user", content: "hello" }],
+          })
+          const error = yield* Effect.promise(() => firstStreamError(result.fullStream))
+          expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+          if (!(error instanceof ProviderError.ResponseStreamError)) throw error
+          expect(error.cause).toBe(failure)
+          expect(error.info).toEqual({ transport: "sse", phase: "before_first_event", autoReplaySafe: true })
+          yield* Effect.promise(() => Bun.sleep(120))
+          expect(signals[0]?.aborted).toBe(false)
+        }),
+      { config: providerConfig("https://example.test", { chunkTimeout: 70 }) },
+    )
+  }),
+)
+
 it.live("chunkTimeout can be disabled with false", () =>
   Effect.gen(function* () {
     const server = yield* Effect.acquireRelease(
