@@ -154,6 +154,139 @@ it.instance(
   { git: true },
 )
 
+it.instance(
+  "ask - interruption during asked publication emits one rejection and clears pending state",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("ses_interrupted_during_asked")
+      const events = yield* EventV2Bridge.Service
+      const asked = yield* Queue.unbounded<void>()
+      const terminal = yield* Queue.unbounded<string>()
+      const off = yield* events.listen((event) => {
+        const data = event.data as { sessionID?: SessionID }
+        if (data.sessionID !== sessionID) return Effect.void
+        if (event.type === Question.Event.Asked.type) {
+          Queue.offerUnsafe(asked, undefined)
+          return Effect.never
+        }
+        if (event.type === Question.Event.Replied.type || event.type === Question.Event.Rejected.type) {
+          Queue.offerUnsafe(terminal, event.type)
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const fiber = yield* askEffect({
+        sessionID,
+        questions: [
+          {
+            question: "Should this disappear during publication?",
+            header: "Cleanup",
+            options: [{ label: "Yes", description: "Remove the stale dock" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      yield* Queue.take(asked).pipe(Effect.timeout("500 millis"))
+      const [pending] = yield* listEffect
+      yield* Fiber.interrupt(fiber)
+
+      expect(yield* Queue.take(terminal).pipe(Effect.timeout("500 millis"))).toBe(Question.Event.Rejected.type)
+      expect(yield* Queue.size(terminal)).toBe(0)
+      expect(yield* listEffect).toEqual([])
+      expect(pending).toBeDefined()
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply owns the terminal event when cancellation races replied publication",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("ses_reply_cancel_race")
+      const events = yield* EventV2Bridge.Service
+      const started = yield* Queue.unbounded<void>()
+      const release = yield* Queue.unbounded<void>()
+      const terminal = yield* Queue.unbounded<string>()
+      const off = yield* events.listen((event) => {
+        const data = event.data as { sessionID?: SessionID }
+        if (data.sessionID !== sessionID) return Effect.void
+        if (event.type === Question.Event.Rejected.type) Queue.offerUnsafe(terminal, event.type)
+        if (event.type !== Question.Event.Replied.type) return Effect.void
+        Queue.offerUnsafe(terminal, event.type)
+        Queue.offerUnsafe(started, undefined)
+        return Queue.take(release)
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const ask = yield* askEffect({
+        sessionID,
+        questions: [
+          {
+            question: "Should the reply win?",
+            header: "Race",
+            options: [{ label: "Yes", description: "Reply owns terminal state" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+      const [pending] = yield* waitForPending(1)
+      const reply = yield* replyEffect({ requestID: pending.id, answers: [["Yes"]] }).pipe(Effect.forkScoped)
+
+      yield* Queue.take(started).pipe(Effect.timeout("500 millis"))
+      yield* Fiber.interrupt(ask)
+      yield* Queue.offer(release, undefined)
+      yield* Fiber.join(reply)
+
+      expect(yield* Queue.take(terminal)).toBe(Question.Event.Replied.type)
+      expect(yield* Queue.size(terminal)).toBe(0)
+      expect(yield* listEffect).toEqual([])
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reject owns exactly one terminal event when cancellation races rejected publication",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("ses_reject_cancel_race")
+      const events = yield* EventV2Bridge.Service
+      const started = yield* Queue.unbounded<void>()
+      const release = yield* Queue.unbounded<void>()
+      const terminal = yield* Queue.unbounded<string>()
+      const off = yield* events.listen((event) => {
+        const data = event.data as { sessionID?: SessionID }
+        if (data.sessionID !== sessionID || event.type !== Question.Event.Rejected.type) return Effect.void
+        Queue.offerUnsafe(terminal, event.type)
+        Queue.offerUnsafe(started, undefined)
+        return Queue.take(release)
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const ask = yield* askEffect({
+        sessionID,
+        questions: [
+          {
+            question: "Should the rejection win?",
+            header: "Race",
+            options: [{ label: "Yes", description: "Reject owns terminal state" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+      const [pending] = yield* waitForPending(1)
+      const reject = yield* rejectEffect(pending.id).pipe(Effect.forkScoped)
+
+      yield* Queue.take(started).pipe(Effect.timeout("500 millis"))
+      yield* Fiber.interrupt(ask)
+      yield* Queue.offer(release, undefined)
+      yield* Fiber.join(reject)
+
+      expect(yield* Queue.take(terminal)).toBe(Question.Event.Rejected.type)
+      expect(yield* Queue.size(terminal)).toBe(0)
+      expect(yield* listEffect).toEqual([])
+    }),
+  { git: true },
+)
+
 // reply tests
 
 it.instance(

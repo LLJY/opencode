@@ -100,10 +100,11 @@ const layer = Layer.effect(
         questions: input.questions,
         tool: input.tool,
       }
-      pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
-
-      return yield* Deferred.await(deferred).pipe(
+      return yield* Effect.gen(function* () {
+        pending.set(id, { info, deferred })
+        yield* events.publish(Event.Asked, info)
+        return yield* Deferred.await(deferred)
+      }).pipe(
         Effect.onInterrupt(() =>
           Effect.sync(() => pending.delete(id)).pipe(
             Effect.flatMap((removed) =>
