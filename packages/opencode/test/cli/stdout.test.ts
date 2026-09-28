@@ -43,6 +43,41 @@ function spawn(stdout: "pipe" | ReturnType<typeof Bun.file>) {
   })
 }
 
+test("successful writes do not retain stdout error listeners", async () => {
+  const proc = Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      `import { Effect } from "effect"
+       import { writeStdout } from "./src/cli/stdout.ts"
+       const before = process.stdout.listenerCount("error")
+       for (let i = 0; i < 12; i++) await Effect.runPromise(writeStdout(""))
+       if (process.stdout.listenerCount("error") !== before) throw new Error("stdout error listener leaked")`,
+    ],
+    { cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+  )
+  expect(await new Response(proc.stderr).text()).toBe("")
+  expect(await proc.exited).toBe(0)
+})
+
+test("non-EPIPE write failures become CliError", async () => {
+  if (process.platform !== "linux") return
+  const proc = Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      `import { Effect } from "effect"
+       import { writeStdout } from "./src/cli/stdout.ts"
+       import { CliError } from "./src/cli/effect-cmd.ts"
+       const err = await Effect.runPromise(writeStdout("x")).then(() => undefined, (cause) => cause)
+       if (!(err instanceof CliError) || !err.message.includes("ENOSPC")) throw new Error("expected CliError for ENOSPC")`,
+    ],
+    { cwd: ROOT, stdout: Bun.file("/dev/full"), stderr: "pipe" },
+  )
+  expect(await new Response(proc.stderr).text()).toBe("")
+  expect(await proc.exited).toBe(0)
+})
+
 // Delay the first read until the pipe fills so returning before stdout drains
 // deterministically exposes truncated output.
 test("large JSON output is complete when the reader is slow", async () => {

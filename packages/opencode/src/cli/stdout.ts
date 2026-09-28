@@ -5,7 +5,8 @@ import { CliError } from "./effect-cmd"
 // as soon as a command returns, so anything still queued on the stream is lost
 // (#29330). Wait for the write callback like generate.ts does. EPIPE means the
 // reader went away (`| head`) and counts as done; the 'error' event that follows a
-// failed write keeps its listener so it cannot crash the process.
+// failed write keeps its listener so it cannot crash the process. A successful
+// write removes its listener so subsequent errors are not swallowed.
 export const writeStdout = (text: string) =>
   Effect.tryPromise({
     try: () =>
@@ -15,7 +16,10 @@ export const writeStdout = (text: string) =>
           return !err || code === "EPIPE" ? resolve() : reject(err)
         }
         process.stdout.once("error", settle)
-        process.stdout.write(text, settle)
+        process.stdout.write(text, (err) => {
+          if (!err) process.stdout.off("error", settle)
+          settle(err)
+        })
       }),
     catch: (cause) => new CliError({ message: `failed to write to stdout: ${String(cause)}` }),
   })
