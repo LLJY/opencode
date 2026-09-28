@@ -32,17 +32,13 @@ function sseFieldScanner() {
   let atLineHead = true
   return (chunk: Uint8Array) => {
     let progress = false
-    let i = 0
-    while (i < chunk.length) {
-      if (atLineHead) {
-        const head = chunk[i]!
-        atLineHead = false
-        if (head !== 0x3a && head !== 0x0a && head !== 0x0d) progress = true
+    for (const byte of chunk) {
+      if (byte === 0x0a || byte === 0x0d) {
+        atLineHead = true
+        continue
       }
-      const nl = chunk.indexOf(0x0a, i)
-      if (nl === -1) break
-      i = nl + 1
-      atLineHead = true
+      if (atLineHead && byte !== 0x3a) progress = true
+      atLineHead = false
     }
     return progress
   }
@@ -57,16 +53,25 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   const progressed = sseFieldScanner()
   let reject: ((error: unknown) => void) | undefined
   let stall: ReturnType<typeof setTimeout> | undefined
+  let remaining = ms
+  let since = 0
 
   const timeout = () => {
+    stall = undefined
     const error = new Error("SSE read timed out")
+    reject?.(error)
     ctl.abort(error)
     reader.cancel(error).catch(() => {})
-    reject?.(error)
   }
   const arm = () => {
+    since = performance.now()
+    stall = setTimeout(timeout, remaining)
+  }
+  const pause = () => {
+    if (stall === undefined) return
     clearTimeout(stall)
-    stall = setTimeout(timeout, ms)
+    stall = undefined
+    remaining = Math.max(0, remaining - (performance.now() - since))
   }
 
   const body = new ReadableStream<Uint8Array>({
@@ -75,21 +80,31 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, rejectPromise) => {
         reject = rejectPromise
         reader.read().then(resolve, rejectPromise)
-      }).finally(() => {
-        reject = undefined
       })
+        .finally(() => {
+          reject = undefined
+        })
+        .catch((error) => {
+          pause()
+          throw error
+        })
 
       if (part.done) {
-        clearTimeout(stall)
+        pause()
         ctrl.close()
         return
       }
 
-      if (progressed(part.value)) arm()
+      if (progressed(part.value)) {
+        pause()
+        remaining = ms
+      }
       ctrl.enqueue(part.value)
+      if (ctrl.desiredSize === null || ctrl.desiredSize <= 0) pause()
+      else if (stall === undefined) arm()
     },
     async cancel(reason) {
-      clearTimeout(stall)
+      pause()
       ctl.abort(reason)
       await reader.cancel(reason)
     },
