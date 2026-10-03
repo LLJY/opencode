@@ -608,10 +608,14 @@ export const Terminal = (props: TerminalProps) => {
         if (disposed) return
         drop?.()
 
-        const ticket = await connectToken().catch((err) => {
-          fail(err)
-          return undefined
-        })
+        const connection = await connectToken()
+          .then((ticket) => ({ ticket }))
+          .catch((err) => {
+            // A failed ticket request does not mean the PTY exited; retry checks its status first.
+            retry(err)
+            return undefined
+          })
+        if (!connection) return
         const protocol = await sdk().protocol
         // if (protocol === "v2" && !ticket) return
         if (once.value) return
@@ -624,7 +628,7 @@ export const Terminal = (props: TerminalProps) => {
             id,
             directory,
             cursor: seek,
-            ticket,
+            ticket: connection.ticket,
             sameOrigin,
             username,
             password,
