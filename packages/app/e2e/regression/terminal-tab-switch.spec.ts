@@ -20,7 +20,7 @@ test.use({ viewport: { width: 1440, height: 900 } })
 // workspace must keep the terminal mounted and its PTY connection open instead
 // of tearing it down and reconnecting.
 test("keeps the terminal session alive when switching session tabs in a workspace", async ({ page }) => {
-  const connections = await setup(page)
+  const { connections } = await setup(page)
 
   await page.goto(sessionHref(sessionA))
   await expectSessionTitle(page, titleA)
@@ -48,6 +48,30 @@ test("keeps the terminal session alive when switching session tabs in a workspac
   expect(connections.length).toBe(1)
 })
 
+test("reconnects the same terminal after a transient connection ticket failure", async ({ page }) => {
+  const creates: string[] = []
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/pty") creates.push(request.url())
+  })
+  const state = await setup(page, true)
+
+  await page.goto(sessionHref(sessionA))
+  await expectSessionTitle(page, titleA)
+  await page.keyboard.press("Control+Backquote")
+
+  const terminal = page.locator('[data-component="terminal"]')
+  await expect(terminal).toBeVisible()
+  await expect.poll(() => state.connections.length).toBe(1)
+  await writeProbe(page)
+  const createCount = creates.length
+
+  state.disconnect()
+  await expect.poll(state.ticketCount).toBe(3)
+  await expect.poll(() => state.connections.length).toBe(2)
+  expect(await readProbe(page)).toBe(PROBE)
+  expect(creates).toHaveLength(createCount)
+})
+
 type Probed = HTMLElement & { __e2eProbe?: string }
 
 async function switchTab(page: Page, title: string) {
@@ -64,9 +88,9 @@ async function readProbe(page: Page) {
   return page.locator('[data-component="terminal"]').evaluate((el) => (el as Probed).__e2eProbe)
 }
 
-async function setup(page: Page) {
+async function setup(page: Page, failSecondTicket = false) {
   await mockOpenCodeServer(page, {
-    protocol: "v2",
+    protocol: failSecondTicket ? "v1" : "v2",
     directory,
     project: {
       id: projectID,
@@ -90,34 +114,50 @@ async function setup(page: Page) {
     sessions: [session(sessionA, titleA, 1700000000000), session(sessionB, titleB, 1700000001000)],
     pageMessages: () => ({ items: [] }),
   })
-  await page.route("**/api/pty*", (route) =>
+  const prefix = failSecondTicket ? "" : "/api"
+  await page.route(`**${prefix}/pty*`, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ location: ptyLocation(), data: ptyInfo() }),
+      body: JSON.stringify(
+        failSecondTicket
+          ? route.request().method() === "POST"
+            ? ptyInfo()
+            : [ptyInfo()]
+          : { location: ptyLocation(), data: ptyInfo() },
+      ),
     }),
   )
-  await page.route(`**/api/pty/${ptyID}*`, (route) =>
+  await page.route(`**${prefix}/pty/${ptyID}*`, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ location: ptyLocation(), data: ptyInfo() }),
+      body: JSON.stringify(failSecondTicket ? ptyInfo() : { location: ptyLocation(), data: ptyInfo() }),
     }),
   )
-  await page.route(`**/api/pty/${ptyID}/connect-token*`, (route) => {
+  let tickets = 0
+  await page.route(`**${prefix}/pty/${ptyID}/connect-token*`, (route) => {
+    tickets += 1
     expect(route.request().headers()["x-opencode-ticket"]).toBe("1")
     const url = new URL(route.request().url())
-    expect(url.searchParams.get("location[directory]")).toBe(directory)
+    expect(url.searchParams.get(failSecondTicket ? "directory" : "location[directory]")).toBe(directory)
+    if (failSecondTicket && tickets === 2) return route.fulfill({ status: 503, body: "Service Unavailable" })
     return route.fulfill({
       status: 200,
       contentType: "application/json",
       headers: { "access-control-allow-origin": "*" },
-      body: JSON.stringify({ location: ptyLocation(), data: { ticket: "e2e-ticket", expires_in: 60 } }),
+      body: JSON.stringify(
+        failSecondTicket
+          ? { ticket: "e2e-ticket", expires_in: 60 }
+          : { location: ptyLocation(), data: { ticket: "e2e-ticket", expires_in: 60 } },
+      ),
     })
   })
   const connections: string[] = []
-  await page.routeWebSocket(new RegExp(`/api/pty/${ptyID}/connect`), (ws) => {
+  let disconnect: (() => void) | undefined
+  await page.routeWebSocket(new RegExp(`/pty/${ptyID}/connect`), (ws) => {
     connections.push(ws.url())
+    disconnect ??= () => ws.close({ code: 1011, reason: "Temporary disconnection" })
   })
 
   await page.addInitScript(
@@ -137,7 +177,11 @@ async function setup(page: Page) {
     },
     { directory, server, sessions: [sessionA, sessionB] },
   )
-  return connections
+  return {
+    connections,
+    disconnect: () => disconnect?.(),
+    ticketCount: () => tickets,
+  }
 }
 
 function session(id: string, title: string, created: number) {
