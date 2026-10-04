@@ -54,8 +54,55 @@ const memoryCredentials = (initial: Credential.Info[]) => {
 
 const connectProvider = (config: typeof ConfigMCP.Remote.Type, store: ReturnType<typeof memoryCredentials>) =>
   Effect.runPromise(
-    McpOAuth.connectProvider({ config, integrationID }).pipe(Effect.provideService(Credential.Service, store.service)),
+    McpOAuth.connectProvider({ config, integrationID }).pipe(
+      Effect.provideService(Credential.Service, store.service),
+      Effect.map((provider) => {
+        if (!provider) throw new Error("Expected OAuth provider")
+        return provider
+      }),
+    ),
   )
+
+test.each(["Authorization", "authorization", "AUTHORIZATION"])(
+  "static %s suppresses connect-time OAuth without touching stored credentials",
+  async (header) => {
+    const config = new ConfigMCP.Remote({
+      type: "remote",
+      url: "https://mcp.example.invalid",
+      oauth: { client_id: "configured-client" },
+      headers: { [header]: "Bearer configured-token" },
+    })
+    const original = credential({ access: "old-access", refresh: "old-refresh", url: config.url })
+    const store = memoryCredentials([original])
+    expect(
+      await Effect.runPromise(
+        McpOAuth.connectProvider({ config, integrationID }).pipe(Effect.provideService(Credential.Service, store.service)),
+      ),
+    ).toBeUndefined()
+    expect(store.rows.get(original.id)).toBe(original)
+  },
+)
+
+test("interactive OAuth is refused before accessing credentials for static Authorization", async () => {
+  const config = new ConfigMCP.Remote({
+    type: "remote",
+    url: "https://mcp.example.invalid",
+    headers: { authorization: "Bearer configured-token" },
+  })
+  const store = memoryCredentials([])
+  const credentials = Credential.Service.of({
+    ...store.service,
+    list: () => Effect.die("OAuth credential access must not occur"),
+  })
+  await expect(
+    Effect.runPromise(
+      McpOAuth.authorize({ name: "static", config, integrationID, methodID }).pipe(
+        Effect.provideService(Credential.Service, credentials),
+        Effect.scoped,
+      ),
+    ),
+  ).rejects.toThrow("OAuth is disabled for MCP server")
+})
 
 // Serves authorization server metadata with the given capabilities and records DCR + token requests.
 const authorizationServer = (metadata: Record<string, unknown>) => {

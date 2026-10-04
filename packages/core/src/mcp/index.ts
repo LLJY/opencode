@@ -18,6 +18,7 @@ import { Location } from "../location.js"
 import { waitForAbort } from "@opencode/util/process"
 import { State } from "../state.js"
 import type { McpClient } from "./client.js"
+import { McpConfig } from "./config.js"
 
 export const ServerName = Schema.String.pipe(Schema.brand("MCP.ServerName"))
 export type ServerName = typeof ServerName.Type
@@ -174,7 +175,7 @@ export const layer = (options?: Options) =>
       // rather than in committed config. Servers that connect anonymously simply never use the method.
       const owned = new Set<Integration.ID>()
       const register = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry) {
-        if (entry.config.type !== "remote" || entry.config.oauth === false) return
+        if (entry.config.type !== "remote" || McpConfig.oauthDisabled(entry.config)) return
         const remote = entry.config
         // Key identity on name + url, not url alone: two configs for the same url under different names are
         // distinct logical servers that may hold different accounts, so they must not share a credential row.

@@ -23,6 +23,7 @@ import { Credential } from "../credential.js"
 import { OauthCallbackPage } from "../oauth/page.js"
 import type { Integration } from "../integration.js"
 import { ErrorSummary } from "../util/error-summary.js"
+import { McpConfig } from "./config.js"
 
 /** Client ID Metadata Document: servers that support CIMD accept this URL as the client_id without registration. */
 export const CLIENT_METADATA_URL = "https://opencode.ai/oauth/opencode/client.json"
@@ -273,6 +274,7 @@ export const connectProvider = Effect.fnUntraced(function* (input: {
   readonly config: typeof ConfigMCP.Remote.Type
   readonly integrationID: Integration.ID
 }) {
+  if (McpConfig.oauthDisabled(input.config)) return undefined
   const credentials = yield* Credential.Service
   const run = Effect.runPromiseWith(yield* Effect.context())
   const found = (yield* credentials.list(input.integrationID)).at(-1)
@@ -334,6 +336,8 @@ export const authorize = (input: {
   readonly methodID: Integration.MethodID
 }) =>
   Effect.gen(function* () {
+    if (McpConfig.oauthDisabled(input.config))
+      return yield* Effect.fail(new Error(`OAuth is disabled for MCP server "${input.name}"`))
     const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
     const context = yield* Effect.context()
     const run = Effect.runPromiseWith(context)

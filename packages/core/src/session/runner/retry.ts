@@ -11,7 +11,26 @@ import { SessionEvent } from "../event.js"
 import { SessionMessage } from "../message.js"
 import { SessionSchema } from "../schema.js"
 
-export { isRetryable }
+const retryable = (error: AIError) => {
+  if (
+    Object.entries(error.reason.http?.headers ?? {}).some(
+      ([key, value]) => key.toLowerCase() === "x-should-retry" && value === "false",
+    )
+  )
+    return false
+  switch (error.reason._tag) {
+    case "RateLimit":
+    case "ProviderInternal":
+    case "UnknownProvider":
+    case "Transport":
+      return isRetryable(error)
+    case "InvalidProviderOutput":
+      return error.reason.classification === "incomplete-stream" && isRetryable(error)
+    default:
+      return false
+  }
+}
+export { retryable as isRetryable }
 
 interface Input {
   readonly cause: AIError
@@ -84,6 +103,7 @@ export const policy = (sessionID: SessionSchema.ID) =>
           decision: input.retry && timeouts <= MAX_TIMEOUT_RETRIES ? { retry: true, delay } : { retry: false },
         }
         yield* input.hook(event)
+        if (!input.retry || !retryable(input.cause) || timeouts > MAX_TIMEOUT_RETRIES) return { retry: false as const }
         if (!event.decision.retry) return event.decision
         const normalized =
           Number.isFinite(event.decision.delay) && event.decision.delay >= 0 ? Math.ceil(event.decision.delay) : delay

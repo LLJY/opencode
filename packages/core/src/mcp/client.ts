@@ -4,6 +4,7 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import {
   Client,
+  ProtocolError,
   SdkError,
   SdkErrorCode,
   SdkHttpError,
@@ -30,6 +31,7 @@ import { Cause, Clock, Duration, Effect, Exit, Schedule, Schema } from "effect"
 import { ConfigMCP } from "@opencode/schema/config/mcp"
 import type { Session } from "@opencode/schema/session"
 import { McpStdio } from "./stdio.js"
+import { McpConfig } from "./config.js"
 
 const DEFAULT_STARTUP_TIMEOUT = 30_000
 const DEFAULT_CATALOG_TIMEOUT = 30_000
@@ -270,7 +272,7 @@ export const connect = Effect.fnUntraced(function* (
     const open = Effect.fnUntraced(function* (url: URL) {
       session.transport = new StreamableHTTPClientTransport(url, {
         requestInit: config.headers ? { headers: config.headers } : undefined,
-        authProvider,
+        authProvider: McpConfig.oauthDisabled(config) ? undefined : authProvider,
         fetch,
       })
       return yield* initialize(session.transport)
@@ -293,6 +295,15 @@ export const connect = Effect.fnUntraced(function* (
   }).pipe(Effect.exit)
   if (Exit.isSuccess(exit)) {
     const client = exit.value
+    // The SDK reuses ProtocolError for local callTool output validation. Only errors
+    // received by the underlying request can prove a wire rejection.
+    const rpcErrors = new WeakSet<Error>()
+    const rpcRequest = client.request.bind(client)
+    client.request = ((...args: Parameters<typeof client.request>) =>
+      rpcRequest(...args).catch((error: unknown) => {
+        if (error instanceof ProtocolError) rpcErrors.add(error)
+        throw error
+      })) as typeof client.request
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
         // Close only aborts streams; the legacy session lives on until the server expires it unless
@@ -350,17 +361,45 @@ export const connect = Effect.fnUntraced(function* (
           client.getPrompt({ name: input.name, arguments: input.args ?? {} }, { signal, timeout: execution }),
         ),
       callTool: (input) =>
-        request("call MCP tool", (signal) =>
-          client.callTool(
-            {
-              name: input.name,
-              arguments: input.args ?? {},
-              ...(input.sessionID === undefined ? {} : { _meta: { "ai.opencode/sessionID": input.sessionID } }),
-            },
-            // Requesting progress keeps long calls alive under the SDK's timeout; execution is the hard wall.
-            { signal, timeout: execution, onprogress: () => {} },
-          ),
-        ).pipe(Effect.map(toCallToolResult)),
+        Effect.tryPromise({
+          try: (signal) =>
+            client.callTool(
+              {
+                name: input.name,
+                arguments: input.args ?? {},
+                ...(input.sessionID === undefined ? {} : { _meta: { "ai.opencode/sessionID": input.sessionID } }),
+              },
+              // Requesting progress keeps long calls alive under the SDK's timeout; execution is the hard wall.
+              { signal, timeout: execution, onprogress: () => {} },
+            ),
+          catch: toError,
+        }).pipe(
+          // Classify the original SDK error before 022's diagnostic formatter flattens it.
+          Effect.retry({
+            times: 3,
+            schedule: Schedule.exponential("1 second"),
+            while: (error) => config.type === "remote" && error instanceof SdkHttpError && error.status === 429,
+          }),
+          Effect.timeout(execution),
+          Effect.catch((error) => {
+            if (Cause.isTimeoutError(error)) return Effect.die(new Error("Request timed out", { cause: error }))
+            const diagnosed = failure(error)
+            if (
+              (error instanceof ProtocolError && rpcErrors.has(error)) ||
+              diagnosed instanceof SessionExpiredError ||
+              error instanceof UnauthorizedError ||
+              (error instanceof SdkHttpError &&
+                error.status >= 400 &&
+                error.status < 500 &&
+                error.status !== 408 &&
+                error.status !== 499)
+            )
+              return Effect.fail(diagnosed)
+            // Lost responses and post-execution local validation are not negative receipts.
+            return Effect.die(new Error(explain(error), { cause: error }))
+          }),
+          Effect.map(toCallToolResult),
+        ),
       onClose: (callback) => {
         client.onclose = () => callback(lastError ? `Connection closed: ${lastError}` : "Connection closed")
       },
