@@ -31,6 +31,7 @@ const asRecord = (value: unknown): Record<string, unknown> =>
 export interface StepRecord {
   /** The model produced visible output this attempt, which bars transparent retries and overflow recovery. */
   readonly outputStarted: boolean
+  readonly meaningfulOutput: boolean
   readonly providerFailed: boolean
   /** The step's recorded assistant failure, if any. */
   readonly failure?: SessionError.Error
@@ -74,7 +75,21 @@ const hostedContent = (result: ToolResultValue): NonEmptyContent => {
  * order: each publishing fiber is sequential, so per-source order holds by construction,
  * and consumers fold by id/ordinal rather than global position.
  */
-export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, input: Input) => {
+export const createLLMEventPublisher = (source: Pick<Bus.Interface, "publish">, input: Input) => {
+  const bus: Pick<Bus.Interface, "publish"> = {
+    publish: (definition, data, options) =>
+      source.publish(definition, data, options).pipe(
+        Effect.tapCause(() =>
+          Effect.sync(() => {
+            if (definition.type !== SessionEvent.Tool.Success.type && definition.type !== SessionEvent.Tool.Failed.type)
+              return
+            // The in-memory mark reserves settlement; only a committed event proves it.
+            const tool = tools.get((data as { readonly id: string }).id)
+            if (tool) tool.settled = false
+          }),
+        ),
+      ),
+  }
   const deltaBatchInterval = 100
   type ToolState = {
     readonly name: string
@@ -93,6 +108,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   let stepStarted = false
   let providerFailed = false
   let outputStarted = false
+  let meaningfulText = false
   let stepFailure: SessionError.Error | undefined
   let stepSettlement: StepRecord["finish"]
 
@@ -214,6 +230,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           text: value,
           state,
         })
+        if (value.trim().length > 0) meaningfulText = true
       }),
     (_textID, value, ordinal) =>
       Effect.gen(function* () {
@@ -616,6 +633,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     /** Immutable snapshot of everything recorded for this step so far. */
     record: (): StepRecord => ({
       outputStarted,
+      meaningfulOutput: meaningfulText || Iterable.some(tools.values(), (tool) => tool.called || tool.settled),
       providerFailed,
       failure: stepFailure,
       finish: stepSettlement,

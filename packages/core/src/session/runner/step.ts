@@ -10,7 +10,7 @@ import {
   type ToolCall,
 } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
-import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Scope, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { Bus } from "../../bus.js"
 import { Permission } from "../../permission.js"
@@ -28,6 +28,7 @@ import { SessionUsage } from "../usage.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
 import { SessionRunnerRetry } from "./retry.js"
+import { TOOL_OUTCOME_UNKNOWN } from "./tool-safety.js"
 
 export type Outcome = Data.TaggedEnum<{
   Completed: { readonly needsContinuation: boolean }
@@ -58,9 +59,7 @@ interface Input {
   readonly recoverOverflow: Effect.Effect<boolean>
 }
 
-const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
 const STEP_INTERRUPTED = { type: "aborted", message: "Step interrupted" } as const
-const RESULT_MISSING = { type: "tool.result-missing", message: "Provider did not return a tool result" } as const
 
 /** Captures Location-scoped dependencies without introducing another service or execution loop. */
 export const make = Effect.gen(function* () {
@@ -69,7 +68,9 @@ export const make = Effect.gen(function* () {
   const snapshots = yield* Snapshot.Service
   const toolOutput = yield* ToolOutput.Service
 
-  const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
+  const attempt = Effect.fn("SessionStep.attempt")(function* (
+    input: Input,
+  ): Effect.fn.Return<Outcome, AIError | StepFailedError, Scope.Scope> {
     const startSnapshot = yield* snapshots.capture()
     const publisher = createLLMEventPublisher(bus, {
       sessionID: input.sessionID,
@@ -121,9 +122,22 @@ export const make = Effect.gen(function* () {
               restore(executeTool(event)).pipe(
                 Effect.flatMap(toolOutput.truncate),
                 Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
-                Effect.catchTag("Tool.Error", (error) =>
-                  publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
-                ),
+                Effect.catchTag("Tool.Error", (error) => {
+                  const failure = toSessionError(error)
+                  // Leaves retain the decision in Tool.Error.error. Feedback is a native
+                  // correction, not a terminal denial or evidence of an unknown effect.
+                  let decision: unknown = error
+                  while (decision instanceof Tool.Error) decision = decision.error
+                  return publisher
+                    .failTool(event.id, failure, error.metadata)
+                    .pipe(
+                      Effect.andThen(
+                        decision instanceof Permission.BlockedError || decision instanceof Permission.DeclinedError
+                          ? Effect.fail(new Permission.DeclinedError())
+                          : Effect.void,
+                      ),
+                    )
+                }),
               ),
             ).pipe(Effect.forkScoped),
           })
@@ -134,7 +148,7 @@ export const make = Effect.gen(function* () {
 
     // Keep the final tool and Step events uninterruptible, even when the work itself is cancelled.
     return yield* Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
+      Effect.gen(function* (): Effect.fn.Return<Outcome, AIError | StepFailedError, Scope.Scope> {
         const stream = yield* restore(providerStream).pipe(Effect.exit)
         const streamFailure = Option.getOrUndefined(Exit.findErrorOption(stream))
         const streamInterrupted = Exit.hasInterrupts(stream)
@@ -179,15 +193,13 @@ export const make = Effect.gen(function* () {
         )
           return Outcome.RecoverFull()
         const retry =
-          llmFailure && llmError && !isContextOverflowFailure(llmFailure)
-            ? yield* restore(
-                input.retry(
-                  llmFailure,
-                  llmError,
-                  SessionRunnerRetry.isRetryable(llmFailure) ||
-                    (recorded.outputStarted && isInterruptedStream(llmFailure)),
-                ),
-              )
+          !tools.failure &&
+          tools.declines.length === 0 &&
+          !tools.interrupted &&
+          llmFailure &&
+          llmError &&
+          !isContextOverflowFailure(llmFailure)
+            ? yield* restore(input.retry(llmFailure, llmError, SessionRunnerRetry.isRetryable(llmFailure)))
             : undefined
         if (llmFailure && llmError && retry?.retry && !recorded.outputStarted) {
           // Retry state projects onto the existing assistant, even before it has produced output.
@@ -206,21 +218,30 @@ export const make = Effect.gen(function* () {
                 : "The user declined this tool call",
           })
         const interrupted = tools.declines.length > 0 || streamInterrupted || tools.interrupted
-        const toolFailure = interrupted
-          ? TOOLS_INTERRUPTED
-          : tools.failure !== undefined
-            ? toSessionError(Cause.squash(tools.failure))
-            : recorded.providerFailed
-              ? TOOLS_INTERRUPTED
+        const toolFailure =
+          tools.failure !== undefined
+            ? TOOL_OUTCOME_UNKNOWN
+            : interrupted || recorded.providerFailed
+              ? TOOL_OUTCOME_UNKNOWN
               : undefined
         if (toolFailure) yield* publisher.failUnsettledTools(toolFailure)
+        if (tools.failure) yield* publisher.failAssistant(toSessionError(Cause.squash(tools.failure)))
         if (interrupted) yield* publisher.failAssistant(STEP_INTERRUPTED)
 
-        // All local fibers have joined; only provider-hosted results can still be missing.
-        if (llmError || (Exit.isSuccess(stream) && !recorded.providerFailed)) {
-          const missing = yield* publisher.failUnsettledTools(RESULT_MISSING, "hosted")
-          if (missing && !llmError && !recorded.finish) yield* publisher.failAssistant(RESULT_MISSING)
-        }
+        // All local fibers have joined; a missing hosted result is not a failed effect.
+        const missing = yield* publisher.failUnsettledTools(TOOL_OUTCOME_UNKNOWN, "hosted")
+        if (missing) yield* publisher.failAssistant(TOOL_OUTCOME_UNKNOWN)
+
+        if (
+          Exit.isSuccess(stream) &&
+          (recorded.finish?.finish === "stop" || recorded.finish?.finish === "length") &&
+          !publisher.record().meaningfulOutput &&
+          !publisher.record().failure
+        )
+          yield* publisher.failAssistant({
+            type: "provider.empty-response",
+            message: "The provider returned an empty response. Please try again.",
+          })
 
         const record = publisher.record()
         if (record.finish || record.failure) {
@@ -256,16 +277,19 @@ export const make = Effect.gen(function* () {
           retry?.retry &&
           record.outputStarted &&
           tools.declines.length === 0 &&
-          !tools.interrupted
+          !tools.interrupted &&
+          !tools.failure &&
+          !missing
         )
           return Outcome.Continue({ error: llmError, decision: retry })
 
+        if (tools.failure) return yield* Effect.failCause(tools.failure)
         if (Exit.isFailure(stream)) return yield* Effect.failCause(stream.cause)
+        if (missing) return yield* new StepFailedError({ error: TOOL_OUTCOME_UNKNOWN })
         if (tools.declines.length > 0) {
           if (input.isLocationClosed()) return Outcome.Completed({ needsContinuation: true })
           return yield* Effect.interrupt
         }
-        if (tools.interrupted && tools.failure) return yield* Effect.failCause(tools.failure)
         if (tools.interrupted && Exit.isFailure(joined)) return yield* Effect.failCause(joined.cause)
         if (record.failure) return yield* new StepFailedError({ error: record.failure })
         return Outcome.Completed({
@@ -277,12 +301,6 @@ export const make = Effect.gen(function* () {
 
   return { attempt }
 })
-
-const isInterruptedStream = (failure: AIError) => {
-  if (failure.reason._tag === "InvalidProviderOutput") return failure.reason.classification === "incomplete-stream"
-  if (failure.reason._tag === "Transport") return failure.reason.operation === "read"
-  return false
-}
 
 /** Tool.Error settles in each fiber; only user declines remain in the typed error channel. */
 const classifyToolExits = (
@@ -302,7 +320,6 @@ const classifyToolExits = (
     : exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
   const failure = causes
     .flatMap((cause) => {
-      if (Cause.hasInterrupts(cause)) return []
       const reasons = cause.reasons.filter(Cause.isDieReason)
       return reasons.length > 0 ? [Cause.fromReasons<never>(reasons)] : []
     })

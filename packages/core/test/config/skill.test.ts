@@ -163,6 +163,36 @@ metadata:
 })
 
 describe("ConfigSkillPlugin.Plugin", () => {
+  it.live("skips implicit compatibility root and skills symlinks but preserves explicit authored sources", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const target = path.join(tmp.path, "authored")
+          const rootTarget = path.join(tmp.path, "compat-root")
+          const claude = path.join(tmp.path, ".claude")
+          const agents = path.join(tmp.path, ".agents")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(target, "review"), { recursive: true })
+            await write(target, "review", "authored source")
+            await fs.mkdir(path.join(rootTarget, "skills", "legacy"), { recursive: true })
+            await write(path.join(rootTarget, "skills"), "legacy", "implicit root alias")
+            await fs.symlink(rootTarget, claude, "dir")
+            await fs.mkdir(agents)
+            await fs.symlink(target, path.join(agents, "skills"), "dir")
+          })
+          yield* startEntries([], tmp.path, tmp.path, emptyDiscovery, {
+            claude: [AbsolutePath.make(claude)],
+            agents: [AbsolutePath.make(agents)],
+          })
+          const skills = yield* Skill.Service
+          expect(yield* skills.list()).toEqual([])
+          yield* start([agents + "/skills"], tmp.path)
+          expect((yield* skills.list()).map((skill) => skill.id)).toEqual([Skill.ID.make("review")])
+        }),
+      ),
+    ),
+  )
+
   it.live("maps config entry types to skill directories", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
       Effect.flatMap((tmp) =>

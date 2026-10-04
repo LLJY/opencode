@@ -425,7 +425,14 @@ describe("V1Migration.transformSession", () => {
     })
     expect(content[1]).toMatchObject({
       id: "running",
-      state: { status: "error", metadata: { phase: "read" } },
+      state: {
+        status: "error",
+        metadata: { phase: "read" },
+        error: {
+          type: "tool.outcome-unknown",
+          message: "Tool outcome is unknown. Reconcile the affected operation before continuing.",
+        },
+      },
       time: { created: 30 },
     })
     expect(content[2]).toMatchObject({

@@ -4,6 +4,8 @@ import os from "node:os"
 import path from "node:path"
 import { OPENCODE_VERSION } from "../src/version"
 import { redactConfig } from "../src/commands/handlers/debug/redact"
+import { isolatedEnv } from "./fixture/environment"
+import { tmpdir } from "./fixture/tmpdir"
 
 describe("debug config command", () => {
   test("is included in troubleshooting help", async () => {
@@ -95,6 +97,60 @@ describe("debug config command", () => {
     }
   })
 })
+
+test("flushes large piped config output before forced successful exit with a delayed reader", async () => {
+  await using root = await tmpdir()
+  const project = path.join(import.meta.dir, "..")
+  const entries = [
+    {
+      type: "document",
+      path: path.join(project, "opencode.json"),
+      info: {
+        permissions: Array.from({ length: 40_000 }, () => ({
+          action: "shell",
+          resource: "git status",
+          effect: "allow",
+        })),
+      },
+    },
+  ]
+  const requested = Promise.withResolvers<void>()
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname === "/api/info") {
+        return Response.json({ version: OPENCODE_VERSION, pid: process.pid, urls: [], paths: { tmp: root.path } })
+      }
+      requested.resolve()
+      return Response.json(entries)
+    },
+  })
+  const registration = path.join(root.path, "state", "opencode", "service-local.json")
+  await fs.mkdir(path.dirname(registration), { recursive: true })
+  await fs.writeFile(
+    registration,
+    JSON.stringify({ version: OPENCODE_VERSION, url: server.url.toString(), pid: process.pid, password: "fixture" }),
+  )
+  const child = Bun.spawn([process.execPath, "run", path.join(import.meta.dir, "../src/index.ts"), "debug", "config"], {
+    cwd: project,
+    env: isolatedEnv(root.path),
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const stderr = new Response(child.stderr).text()
+  try {
+    await requested.promise
+    await Bun.sleep(250)
+    const stdout = await new Response(child.stdout).text()
+    expect({ exitCode: await child.exited, stderr: await stderr }).toEqual({ exitCode: 0, stderr: "" })
+    expect(stdout.length).toBeGreaterThan(4_000_000)
+    expect(stdout).toBe(JSON.stringify(entries, null, 2) + "\n")
+  } finally {
+    child.kill()
+    await child.exited
+    server.stop(true)
+  }
+}, 30_000)
 
 test("redacts URL credentials and credential environment variables without mutating config", () => {
   const input = {

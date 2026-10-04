@@ -137,6 +137,8 @@ const SUMMARY_RULES = `Rules:
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
 - Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
 - Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
+- If an explicit workflow is active, preserve its exact workflow mode, workplan path, current phase/step, checklist state, checker status, and whether execution or continuation is required or awaiting approval.
+- Do not invent an explicit workflow when none is active, or infer approval from a plan or checkpoint.
 - Do not mention the summary process or that context was compacted.`
 
 export const buildPrompt = (update: boolean, legacy = false) => {

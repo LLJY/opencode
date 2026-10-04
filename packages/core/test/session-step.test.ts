@@ -158,3 +158,92 @@ for (const fixture of [
     }),
   )
 }
+
+for (const finish of ["stop", "length"] as const)
+  for (const [name, events] of [
+    ["no blocks", []],
+    ["empty text block", [LLMEvent.textStart({ id: "text" }), LLMEvent.textEnd({ id: "text" })]],
+    [
+      "whitespace",
+      [
+        LLMEvent.textStart({ id: "text" }),
+        LLMEvent.textDelta({ id: "text", text: " \n\t" }),
+        LLMEvent.textEnd({ id: "text" }),
+      ],
+    ],
+    [
+      "hidden reasoning",
+      [
+        LLMEvent.reasoningStart({ id: "reason" }),
+        LLMEvent.reasoningDelta({ id: "reason", text: "thinking" }),
+        LLMEvent.reasoningEnd({ id: "reason" }),
+      ],
+    ],
+  ] as const) {
+    it.effect(`fails an empty meaningful assistant turn: ${name} (${finish})`, () =>
+      Effect.gen(function* () {
+        const db = (yield* Database.Service).db
+        const llm = yield* TestLLM.Test
+        const sessionID = Session.ID.create()
+        const assistantMessageID = SessionMessage.ID.create()
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+          .run()
+        yield* db
+          .insert(SessionTable)
+          .values({
+            id: sessionID,
+            project_id: Project.ID.global,
+            slug: "empty",
+            directory: "/project",
+            version: "test",
+          })
+          .run()
+        const steps = yield* SessionStep.make.pipe(
+          Effect.provide(Layer.mock(Snapshot.Service)({ capture: () => Effect.succeed(undefined) })),
+        )
+        const model = SessionRunnerModel.resolved(
+          LanguageModel.make({ id: "test", provider: "test", route: OpenAIChat.route }),
+          {
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+            limit: { context: 100_000, output: 1_000 },
+            cost: [],
+          },
+        )
+        yield* llm.push(TestLLM.complete({ reason: { normalized: finish } }, ...events))
+        const result = yield* steps
+          .attempt({
+            isLocationClosed: () => false,
+            sessionID,
+            assistantMessageID,
+            agent: Agent.defaultID,
+            model,
+            prepared: {
+              retry: () => Effect.void,
+              request: LLM.request({ model: model.model, prompt: "Answer" }),
+              options: {},
+              executeTool: () => Effect.die("No tool expected"),
+            },
+            retry: () => Effect.succeed({ retry: false }),
+            recoverContinuation: true,
+            recoverOverflow: Effect.succeed(false),
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(result)).toBe(true)
+        const message = yield* db
+          .select()
+          .from(SessionMessageTable)
+          .where(eq(SessionMessageTable.id, assistantMessageID))
+          .get()
+        expect(message?.data).toMatchObject({ error: { type: "provider.empty-response" } })
+        const recorded = yield* db
+          .select({ type: EventTable.type })
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, sessionID))
+          .all()
+        expect(recorded.filter((event) => event.type === "session.step.failed.1")).toHaveLength(1)
+        expect(recorded.some((event) => event.type === "session.step.ended.1")).toBe(false)
+      }),
+    )
+  }

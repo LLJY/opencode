@@ -36,6 +36,7 @@ import { McpResourceTools } from "@opencode/core/tool/plugin/mcp-resource"
 import { Tool } from "@opencode/core/tool"
 import { ToolOutput } from "@opencode/core/tool-output"
 import {
+  Cause,
   Context,
   Deferred,
   Effect,
@@ -516,6 +517,145 @@ describe("MCP errors", () => {
 test("MCP tool names match V1 sanitization", () => {
   expect(McpTool.namespace("context 7")).toBe("context_7")
   expect(McpTool.name("context 7", "resolve.library/id")).toBe("context_7_resolve_library_id")
+})
+
+test("retries definite HTTP 429 tool rejection without duplicating an accepted effect", async () => {
+  let attempts = 0
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({
+          respond: async (request) => {
+            if (request.method !== "POST") return
+            const body = (await request.clone().json()) as { method?: string }
+            if (body.method !== "tools/call") return
+            attempts += 1
+            if (attempts === 1) return new Response("rate limited", { status: 429, headers: { "retry-after": "0" } })
+          },
+        })
+        const connection = yield* connect(
+          "rate-limit",
+          new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false }),
+          import.meta.dir,
+        )
+        const result = yield* connection.callTool({ name: "echo", args: { text: "once" } })
+        expect(result.isError).toBe(false)
+        expect(attempts).toBe(2)
+        expect(server.state.toolCalls).toHaveLength(1)
+      }),
+    ),
+  )
+})
+
+test("definite MCP 429 retries stop after three retries and never accept an effect", async () => {
+  let attempts = 0
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({
+          respond: async (request) => {
+            if (request.method !== "POST") return
+            const body = (await request.clone().json()) as { method?: string }
+            if (body.method !== "tools/call") return
+            attempts++
+            return new Response("rate limited", { status: 429 })
+          },
+        })
+        const connection = yield* connect(
+          "bounded-rate-limit",
+          new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false }),
+          import.meta.dir,
+        )
+        const exit = yield* connection.callTool({ name: "echo" }).pipe(Effect.exit)
+        expect(attempts).toBe(4)
+        expect(server.state.toolCalls).toHaveLength(0)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(false)
+      }),
+    ),
+  )
+}, 15_000)
+
+test.each([false, true])("MCP output validation distinguishes a wire rejection: %s", async (rejected) => {
+  let effects = 0
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({
+          respond: async (request) => {
+            if (request.method !== "POST") return
+            const body = (await request.clone().json()) as { method?: string; id?: string | number }
+            if (body.method === "tools/list")
+              return Response.json({
+                jsonrpc: "2.0",
+                id: body.id,
+                result: {
+                  tools: [
+                    {
+                      name: "echo",
+                      inputSchema: { type: "object" },
+                      outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+                    },
+                  ],
+                },
+              })
+            if (body.method !== "tools/call") return
+            effects += 1
+            return Response.json({
+              jsonrpc: "2.0",
+              id: body.id,
+              ...(rejected
+                ? { error: { code: -32602, message: "Explicit wire rejection" } }
+                : {
+                    result: {
+                      content: [{ type: "text", text: "effect accepted" }],
+                      structuredContent: { ok: "invalid" },
+                    },
+                  }),
+            })
+          },
+        })
+        const connection = yield* connect(
+          "output-provenance",
+          new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false }),
+          import.meta.dir,
+        )
+        yield* connection.tools()
+        const exit = yield* connection.callTool({ name: "echo" }).pipe(Effect.exit)
+        expect(effects).toBe(1)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(!rejected)
+      }),
+    ),
+  )
+})
+
+test("uncertain MCP transport failure is not a settled tool-failure receipt or automatic replay", async () => {
+  let effects = 0
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({
+          respond: async (request) => {
+            if (request.method !== "POST") return
+            const body = (await request.clone().json()) as { method?: string }
+            if (body.method !== "tools/call") return
+            effects += 1
+            return new Response("gateway failed after accepting the operation", { status: 502 })
+          },
+        })
+        const connection = yield* connect(
+          "uncertain-effect",
+          new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false }),
+          import.meta.dir,
+        )
+        const exit = yield* connection.callTool({ name: "echo" }).pipe(Effect.exit)
+        expect(effects).toBe(1)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(exit.cause.reasons.some(Cause.isDieReason)).toBe(true)
+      }),
+    ),
+  )
 })
 
 test("passes session IDs as MCP request metadata", async () => {

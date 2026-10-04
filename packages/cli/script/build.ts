@@ -10,6 +10,12 @@ import pkg from "../package.json"
 import { buildAppArchive } from "./app-assets"
 import { verifyArtifact, verifySimulationGraph } from "./verify-artifact"
 import { resolveOpencodePty } from "./opencode-pty"
+import { validateBuildArgs } from "./build-args"
+
+validateBuildArgs(process.argv.slice(2), {
+  flags: ["--single", "--baseline", "--skip-install", "--skip-web-ui"],
+  values: ["--outdir", "--target"],
+})
 
 const dir = path.resolve(import.meta.dirname, "..")
 const binary = "opencode"
@@ -18,9 +24,6 @@ const outdir = path.resolve(
   process.argv.find((arg) => arg.startsWith("--outdir="))?.slice("--outdir=".length) ?? "dist",
 )
 if (outdir === dir) throw new Error("--outdir must not be the package directory")
-process.chdir(dir)
-
-await rm(outdir, { recursive: true, force: true })
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -61,6 +64,9 @@ const targets =
         })
       : allTargets
 if (!targets.length) throw new Error(`Unknown build target: ${requestedTarget}`)
+
+process.chdir(dir)
+await rm(outdir, { recursive: true, force: true })
 
 if (!skipInstall)
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]} @opencode-ai/pty@${pkg.dependencies["@opencode-ai/pty"]}`

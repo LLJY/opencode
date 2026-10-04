@@ -118,19 +118,22 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
         }),
       )
       const http = RequestExecutor.responseHttp(response)
-      const remaining = Duration.subtract(total, Duration.millis((yield* Clock.currentTimeMillis) - started))
       return {
-        frames: prepared.framing.frame(
-          RequestExecutor.responseStream(response).pipe(
-            Stream.timeoutOrElse({
-              duration: timeoutDuration(request.http?.chunkTimeout),
-              orElse: () => Stream.fail(timeout("read", "Timed out waiting for response data", http)),
+        // Charge active upstream waits for framed progress, not comment heartbeats or consumer pauses.
+        // Check the absolute whole-request budget on every pull, even if frames were already queued.
+        frames: Stream.transformPull(prepared.framing.frame(RequestExecutor.responseStream(response)), (pull) =>
+          Effect.succeed(
+            Effect.gen(function* () {
+              const remaining = Duration.subtract(total, Duration.millis((yield* Clock.currentTimeMillis) - started))
+              if (Duration.toMillis(remaining) <= 0)
+                return yield* timeout("read", "Timed out waiting for the response to complete", http)
+              return yield* pull.pipe(
+                Effect.timeoutOrElse({
+                  duration: Duration.min(timeoutDuration(request.http?.chunkTimeout), remaining),
+                  orElse: () => timeout("read", "Timed out waiting for response data", http),
+                }),
+              )
             }),
-            Stream.interruptWhen(
-              Effect.sleep(remaining).pipe(
-                Effect.andThen(Effect.fail(timeout("read", "Timed out waiting for the response to complete", http))),
-              ),
-            ),
           ),
         ),
         http,
