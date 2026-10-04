@@ -9,6 +9,7 @@ import {
 } from "effect/unstable/http"
 import { HttpContext, HttpRateLimitDetails, AIError, TransportError } from "../schema/index.js"
 import { classifyProviderFailure, providerErrorMessage } from "../provider-error.js"
+import { parseHttpDate } from "../utils/http-date.js"
 import { Service, type HttpMiddleware, type Interface } from "./executor-service.js"
 
 export { Service } from "./executor-service.js"
@@ -20,19 +21,23 @@ const headerDetails = (headers: Headers.Headers) =>
 const normalizedHeaders = (headers: Headers.Headers) =>
   Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]))
 
+const unsigned = (value: string | undefined, grammar: RegExp) => {
+  if (value === undefined || !grammar.test(value.trim())) return undefined
+  const number = Number(value.trim())
+  return Number.isFinite(number) ? number : undefined
+}
+
 const retryAfterMs = (headers: Record<string, string>) => {
-  const millis = Number(headers["retry-after-ms"])
-  if (Number.isFinite(millis)) return Math.max(0, millis)
-
+  // A valid zero is authoritative; only malformed hints defer to the next header.
+  const millis = unsigned(headers["retry-after-ms"], /^\d+(?:\.\d+)?$/)
+  if (millis !== undefined) return millis
   const value = headers["retry-after"]
-  if (!value) return undefined
-
-  const seconds = Number(value)
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
-
-  const date = Date.parse(value)
-  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
-  return undefined
+  if (value === undefined) return undefined
+  const seconds = unsigned(value, /^\d+$/)
+  if (seconds !== undefined) return Math.ceil(seconds * 1000)
+  const now = Date.now()
+  const date = parseHttpDate(value.trim(), now)
+  return date === undefined ? undefined : Math.max(0, date - now)
 }
 
 const addRateLimitValue = (target: Record<string, string>, key: string, value: string) => {

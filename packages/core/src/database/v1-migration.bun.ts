@@ -5,6 +5,7 @@ import { Database } from "./database.js"
 import { SessionMessageTable, SessionTable } from "../session/sql.js"
 import { SessionV1 } from "@opencode/schema/session-v1"
 import { SessionMessage } from "../session/message.js"
+import { TOOL_OUTCOME_UNKNOWN } from "../session/runner/tool-safety.js"
 import { SessionSchema } from "../session/schema.js"
 import { KVTable } from "../kv/sql.js"
 import { EventSequenceTable } from "../event/sql.js"
@@ -996,7 +997,10 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
     state: {
       status: "error",
       input: part.state.input,
-      error: { type: "tool.interrupted", message: "Tool execution was interrupted before V2 migration" },
+      error:
+        part.state.status === "running"
+          ? TOOL_OUTCOME_UNKNOWN
+          : { type: "tool.interrupted", message: "Tool execution was interrupted before V2 migration" },
       ...(part.state.status === "running" && part.state.metadata ? { metadata: part.state.metadata } : {}),
     },
     time: { created: part.state.status === "running" ? part.state.time.start : fallback },

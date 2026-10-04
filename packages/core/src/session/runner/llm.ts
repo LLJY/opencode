@@ -31,6 +31,7 @@ import { SessionStep } from "./step.js"
 import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
+import { TOOL_OUTCOME_UNKNOWN } from "./tool-safety.js"
 
 const CONTINUE_AFTER_INCOMPLETE_STREAM =
   "The previous response was interrupted. Continue from where you left off without repeating completed content."
@@ -329,10 +330,15 @@ const layer = Layer.effect(
     const settleStaleToolCalls = Effect.fn("SessionRunner.settleStaleToolCalls")(function* (
       sessionID: SessionSchema.ID,
     ) {
+      let unknown = false
       for (const message of yield* store.context(sessionID)) {
         if (message.type !== "assistant") continue
         for (const tool of message.content) {
-          if (tool.type !== "tool" || (tool.state.status !== "streaming" && tool.state.status !== "running")) continue
+          if (tool.type !== "tool") continue
+          if (tool.state.status === "error" && tool.state.error.type === TOOL_OUTCOME_UNKNOWN.type) unknown = true
+          if (tool.state.status !== "streaming" && tool.state.status !== "running") continue
+          const running = tool.state.status === "running"
+          if (running) unknown = true
           const metadata = tool.state.status === "running" ? tool.state.metadata : undefined
           const childID =
             tool.name === "subagent" && typeof metadata?.sessionID === "string" ? metadata.sessionID : undefined
@@ -341,14 +347,15 @@ const layer = Layer.effect(
             assistantMessageID: message.id,
             id: tool.id,
             error: {
-              type: "aborted",
-              message: `Tool execution interrupted: ${tool.name}${childID ? ` (sessionID: ${childID})` : ""}`,
+              ...(running ? TOOL_OUTCOME_UNKNOWN : { type: "aborted", message: "Tool input was not executed" }),
+              message: `${running ? TOOL_OUTCOME_UNKNOWN.message : "Tool input was not executed"}: ${tool.name}${childID ? ` (sessionID: ${childID})` : ""}`,
             },
             ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
             executed: tool.executed === true,
           })
         }
       }
+      if (unknown) return yield* new StepFailedError({ error: TOOL_OUTCOME_UNKNOWN })
     })
 
     return Service.of({ drain })

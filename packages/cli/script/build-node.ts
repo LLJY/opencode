@@ -13,6 +13,12 @@ import { mainConfig } from "../vite.node.config"
 import { nodeExecArgv, nodeTarget, type NodeTarget } from "../src/node/target"
 import { buildAppArchive } from "./app-assets"
 import { verifyArtifact } from "./verify-artifact"
+import { validateBuildArgs } from "./build-args"
+
+validateBuildArgs(process.argv.slice(2), {
+  flags: ["--bundle-only", "--single", "--skip-install", "--app-archive-only"],
+  values: ["--outdir", "--target", "--app-archive"],
+})
 
 const NODE_VERSION = "26.4.0"
 const dir = path.resolve(import.meta.dirname, "..")
@@ -44,20 +50,20 @@ const targets = requested
     ? [nodeTarget(process.platform, process.arch)]
     : allTargets
 
-process.chdir(dir)
-if (!skipInstall) run(process.execPath, ["install", "--os=*", "--cpu=*"])
-if (appArchiveOnly) {
-  if (!archivePath) throw new Error("--app-archive-only requires --app-archive=<path>")
-  await mkdir(path.dirname(archivePath), { recursive: true })
-  await writeFile(archivePath, await buildAppArchive(Script.channel))
-  process.exit(0)
-}
+if (appArchiveOnly && !archivePath) throw new Error("--app-archive-only requires --app-archive=<path>")
 if (targets.length === 0) {
   if (requested === "darwin-x64") throw new Error("Node 26.4 SEA does not support macOS x64")
   throw new Error(`Unknown Node target: ${requested}`)
 }
 if (!bundleOnly && targets.some((target) => target.platform === "darwin" && target.arch === "x64")) {
   throw new Error("Node 26.4 SEA does not support macOS x64")
+}
+process.chdir(dir)
+if (!skipInstall) run(process.execPath, ["install", "--os=*", "--cpu=*"])
+if (appArchiveOnly) {
+  await mkdir(path.dirname(archivePath!), { recursive: true })
+  await writeFile(archivePath!, await buildAppArchive(Script.channel))
+  process.exit(0)
 }
 const appArchive = archivePath ? (await Bun.file(archivePath).text()).trim() : await buildAppArchive(Script.channel)
 if (!bundleOnly) await rm(outdir, { recursive: true, force: true })

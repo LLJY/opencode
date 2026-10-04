@@ -282,7 +282,7 @@ describe("toSessionError", () => {
     expect(ineligible.map(SessionRunnerRetry.isRetryable)).toEqual([false, false])
   })
 
-  test("honors provider retry header overrides", () => {
+  test("honors negative provider hints without promoting invalid requests", () => {
     const http = (headers: Record<string, string>) =>
       new HttpContext({
         url: "https://example.com",
@@ -304,6 +304,6 @@ describe("toSessionError", () => {
       SessionRunnerRetry.isRetryable(
         llm(new InvalidRequestError({ message: "retry", http: http({ "x-should-retry": "true" }) })),
       ),
-    ).toBeTrue()
+    ).toBeFalse()
   })
 })

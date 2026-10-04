@@ -139,6 +139,16 @@ it.effect("compaction truncation does not split surrogate pairs", () =>
   }),
 )
 
+test.each([false, true])("compaction preserves conditional explicit workflow state (update=%s)", (update) => {
+  const prompt = SessionCompaction.buildPrompt(update)
+  expect(prompt).toContain("exact workflow mode")
+  expect(prompt).toContain("workplan path")
+  expect(prompt).toContain("current phase/step")
+  expect(prompt).toContain("checker status")
+  expect(prompt).toContain("awaiting approval")
+  expect(prompt).toContain("Do not invent an explicit workflow")
+})
+
 test("compaction prompt requires the checkpoint headings in order", () => {
   const prompt = SessionCompaction.buildPrompt(false)
   expect(prompt.match(/^#{2,3} .+$/gm)).toEqual([

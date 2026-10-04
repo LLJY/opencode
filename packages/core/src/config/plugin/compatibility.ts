@@ -19,6 +19,11 @@ export const Plugin = define({
     const changes = yield* PubSub.sliding<string>(1)
     const lock = Semaphore.makeUnsafe(1)
     const skills: Skill.Info[] = []
+    const linked = (target: string) =>
+      fs.readLink(target).pipe(
+        Effect.as(true),
+        Effect.orElseSucceed(() => false),
+      )
 
     const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (
       target: string,
@@ -40,11 +45,12 @@ export const Plugin = define({
         const directories = [...roots.claude, ...roots.agents].map((root) => path.join(root, "skills"))
         const loaded = new Map<Skill.ID, Skill.Info>()
         for (const directory of directories) {
+          if ((yield* linked(path.dirname(directory))) || (yield* linked(directory))) continue
           const resolved = yield* fs.realPath(directory).pipe(Effect.orElseSucceed(() => undefined))
           if (!resolved) continue
           yield* watch(resolved, "directory")
           const files = yield* fs
-            .scan("{*.md,**/SKILL.md}", { cwd: resolved, absolute: true, include: "file", symlink: true, dot: true })
+            .scan("{*.md,**/SKILL.md}", { cwd: resolved, absolute: true, include: "file", symlink: false, dot: true })
             .pipe(Effect.orElseSucceed(() => [] as string[]))
           for (const filepath of files.toSorted()) {
             const content = yield* fs.readFileStringSafe(filepath).pipe(Effect.orElseSucceed(() => undefined))

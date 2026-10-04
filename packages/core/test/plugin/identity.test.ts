@@ -24,8 +24,8 @@ test("formats the model identity part", () => {
   ).toBe(["# Your Model", "- Name: GPT-4o mini", "- Provider ID: openai", "- Model ID: gpt-4o-mini"].join("\n"))
 })
 
-const identity = (name: string, id: string) =>
-  ["# Your Model", `- Name: ${name}`, "- Provider ID: test", `- Model ID: ${id}`].join("\n")
+const identity = (name: string, id: string, version: string) =>
+  ["# Your Model", `- Name: ${name}`, "- Provider ID: test", `- Model ID: ${id}`, `- OpenCode version: ${version}`].join("\n")
 
 const context = (id: string): SessionHooks["context"] => ({
   sessionID: Session.ID.make("ses_model_identity"),
@@ -36,6 +36,20 @@ const context = (id: string): SessionHooks["context"] => ({
   tools: {},
   options: {},
 })
+
+it.effect("includes the actual running version in context, compaction and generate identity", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const hooks = yield* PluginHooks.Service
+    const host = yield* PluginHost.make(plugins)
+    yield* IdentityPlugin.Plugin.effect(host)
+    for (const name of ["context", "compaction", "generate"] as const) {
+      const event = context("unknown-model")
+      yield* hooks.trigger("session", name, event)
+      expect(event.system[1]?.text).toContain(`- OpenCode version: ${host.app.version}`)
+    }
+  }),
+)
 
 it.effect("inserts the structured model block after the agent prompt", () =>
   Effect.gen(function* () {
@@ -54,7 +68,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
     yield* hooks.trigger("session", "context", named)
     expect(named.system.map((part) => part.text)).toEqual([
       "Agent prompt",
-      identity("Muse Spark", "meta/muse-spark-1.1"),
+      identity("Muse Spark", "meta/muse-spark-1.1", pluginHost.app.version),
       "Initial context",
     ])
 
@@ -62,7 +76,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
     yield* hooks.trigger("session", "context", fallback)
     expect(fallback.system.map((part) => part.text)).toEqual([
       "Agent prompt",
-      identity("unknown-model", "unknown-model"),
+      identity("unknown-model", "unknown-model", pluginHost.app.version),
       "Initial context",
     ])
   }),

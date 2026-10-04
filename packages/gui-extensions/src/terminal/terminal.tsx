@@ -648,7 +648,7 @@ export const Terminal = (props: TerminalProps) => {
             cursor: seek,
           })
           .catch((err) => {
-            fail(err)
+            retry(err)
 
             return undefined
           })

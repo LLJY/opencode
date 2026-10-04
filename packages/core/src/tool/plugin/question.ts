@@ -29,9 +29,11 @@ export const Output = Schema.Struct({
 })
 export type Output = typeof Output.Type
 
-export class CancelledError extends Schema.TaggedError<CancelledError>()("QuestionTool.CancelledError", {}) {
+export class CancelledError extends Schema.TaggedError<CancelledError>()("QuestionTool.CancelledError", {
+  feedback: Schema.optional(Schema.String),
+}) {
   override get message() {
-    return "The user dismissed this question"
+    return this.feedback ?? "The user dismissed this question"
   }
 }
 
@@ -90,11 +92,9 @@ export const Plugin = {
                   // Deliberate defect tunnel (see Permission.assert): a dismissal must dodge
                   // leaf `mapError` blankets so it never becomes model-facing tool output; it
                   // resurfaces as a typed failure at SessionModelRequest.executeTool.
-                  // A dismissal with a message (e.g. from a non-interactive client) is ordinary
-                  // model-facing feedback: the model continues instead of the step ending.
-                  if (state.status === "cancelled" && state.message !== undefined)
-                    return Effect.fail(new ToolFailure({ message: state.message }))
-                  if (state.status === "cancelled") return Effect.die(new CancelledError())
+                  // Feedback describes the cancellation; it must not turn a dismissal into
+                  // an ordinary failure that the model can autonomously continue from.
+                  if (state.status === "cancelled") return Effect.die(new CancelledError({ feedback: state.message }))
                   const output = {
                     answers: input.questions.map((_, index): Question.Answer => {
                       const value = state.answer[`q${index}`]

@@ -4,6 +4,7 @@ import {
   GenerationOptions,
   type GenerationOptionsFields,
   HttpOptions,
+  mergeHttpOptions,
   LanguageModel,
   LLM,
   LLMRequest,
@@ -261,19 +262,23 @@ export const layer = Layer.effect(
       const affinity = SessionAffinity.get(session)
       const base = LLM.request({
         model: model.model,
-        http: {
-          headers: {
-            "x-opencode-session-id": session.id,
-            ...(session.parentID ? { "x-opencode-parent-session-id": session.parentID } : {}),
-            "x-session-affinity": affinity,
-            "X-Session-Id": affinity,
-            ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),
-            "User-Agent": App.useragent(app),
-            "x-opencode-project": session.projectID,
-            "x-opencode-session": affinity,
-            "x-opencode-client": app.name,
-          },
-        },
+        http: mergeHttpOptions(
+          model.model.route.defaults.http,
+          model.model.defaults?.http,
+          new HttpOptions({
+            headers: {
+              "x-opencode-session-id": session.id,
+              ...(session.parentID ? { "x-opencode-parent-session-id": session.parentID } : {}),
+              "x-session-affinity": affinity,
+              "X-Session-Id": affinity,
+              ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),
+              "User-Agent": App.useragent(app),
+              "x-opencode-project": session.projectID,
+              "x-opencode-session": affinity,
+              "x-opencode-client": app.name,
+            },
+          }),
+        ),
         // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
         promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
         system: shaped.system,
@@ -392,7 +397,15 @@ export const layer = Layer.effect(
                     ? [r.defect]
                     : [],
                 )[0]
-                return decline ? Result.succeed(decline) : Result.fail(cause)
+                // Recover only a pure negative decision, never erase sibling defects or interruption.
+                return decline &&
+                  cause.reasons.every(
+                    (r) =>
+                      Cause.isDieReason(r) &&
+                      (r.defect instanceof Permission.DeclinedError || r.defect instanceof QuestionTool.CancelledError),
+                  )
+                  ? Result.succeed(decline)
+                  : Result.fail(cause)
               },
               (decline) => Effect.fail(decline),
             ),

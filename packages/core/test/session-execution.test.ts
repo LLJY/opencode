@@ -46,6 +46,16 @@ describe("SessionExecution lifecycle", () => {
     ).toEqual({ type: "failed", error: { type: "provider.transport", message: "Disconnected" } })
   })
 
+  test("mixed interruption and failure remains a failed terminal", () => {
+    const interrupt = Effect.runSyncExit(Effect.interrupt)
+    if (Exit.isSuccess(interrupt)) throw new Error("Expected interruption")
+    const cause = Cause.fromReasons([...interrupt.cause.reasons, ...Cause.die(new Error("effect failed")).reasons])
+    expect(SessionExecution.terminal(Exit.failCause(cause), "user")).toEqual({
+      type: "failed",
+      error: { type: "unknown", message: "effect failed" },
+    })
+  })
+
   test("defaults owner-scope interruption to shutdown and preserves explicit reasons", () => {
     const interrupted = Effect.runSyncExit(Effect.interrupt)
     expect(SessionExecution.terminal(interrupted)).toEqual({ type: "interrupted", reason: "shutdown" })
