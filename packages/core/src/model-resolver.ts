@@ -288,7 +288,10 @@ function prepareProviderSettings(
   )
 }
 
-function prepareProviderURL(model: RuntimeInfo, baseURL: string): Effect.Effect<string, UnresolvedProviderVariablesError> {
+function prepareProviderURL(
+  model: RuntimeInfo,
+  baseURL: string,
+): Effect.Effect<string, UnresolvedProviderVariablesError> {
   if (!baseURL.includes("${")) return Effect.succeed(baseURL)
   const prepared = baseURL.replace(/\$\{([^}]+)\}/g, (placeholder, name: string) => process.env[name] ?? placeholder)
   const failure = unresolvedProviderVariables(model, prepared)

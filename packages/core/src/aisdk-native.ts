@@ -149,8 +149,7 @@ function resolve(specifier: string, context: Context & { readonly settings?: Pro
   if (Provider.isAISDK(specifier) || npm in PACKAGES || npm in (HOSTS[context.providerID] ?? {}))
     return native(npm, context)
   if (npm === "@opencode/ai/providers/amazon-bedrock/mantle") return mantle(context.modelID)
-  if (npm === "@opencode/ai/providers/azure/responses" && azureChat(context))
-    return "@opencode/ai/providers/azure/chat"
+  if (npm === "@opencode/ai/providers/azure/responses" && azureChat(context)) return "@opencode/ai/providers/azure/chat"
   return NATIVE.has(npm) ? npm : undefined
 }
 
