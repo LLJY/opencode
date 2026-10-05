@@ -278,8 +278,9 @@ export const connect = Effect.fnUntraced(function* (
       return yield* initialize(session.transport)
     })
 
-    // Every attempt opens a fresh transport; no retry starts once the startup timeout has passed.
-    const deadline = (yield* Clock.currentTimeMillis) + (config.timeout?.startup ?? DEFAULT_STARTUP_TIMEOUT)
+    // Every attempt opens a fresh transport; retries and the query fallback share one startup budget.
+    const startup = config.timeout?.startup ?? DEFAULT_STARTUP_TIMEOUT
+    const deadline = (yield* Clock.currentTimeMillis) + startup
     return yield* retrying(
       "MCP connect",
       open(url).pipe(
@@ -291,6 +292,11 @@ export const connect = Effect.fnUntraced(function* (
         }),
       ),
       deadline,
+    ).pipe(
+      Effect.timeoutOrElse({
+        duration: startup,
+        orElse: () => Effect.fail(new Error(`MCP startup timed out after ${startup}ms`)),
+      }),
     )
   }).pipe(Effect.exit)
   if (Exit.isSuccess(exit)) {
