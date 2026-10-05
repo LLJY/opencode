@@ -1116,6 +1116,166 @@ test("applies configured MCP timeouts to resource operations", async () => {
   await expect(read).rejects.toThrow("Request timed out")
 })
 
+testEffect(Layer.empty).live("MCP startup budget caps a stalled remote retry", () =>
+  Effect.gen(function* () {
+    let attempts = 0
+    let aborted = 0
+    const server = yield* resourceServer({
+      respond: async (request) => {
+        if (request.method !== "POST") return
+        const body = (await request.clone().json()) as { method?: string }
+        if (body.method !== "initialize") return
+        attempts += 1
+        if (attempts === 1) return new Response("restarting", { status: 503 })
+        return new Promise<Response>((resolve) => {
+          request.signal.addEventListener(
+            "abort",
+            () => {
+              aborted += 1
+              resolve(new Response("aborted", { status: 503 }))
+            },
+            { once: true },
+          )
+        })
+      },
+    })
+    const started = performance.now()
+    const error = yield* connect(
+      "startup-budget",
+      new ConfigMCP.Remote({
+        type: "remote",
+        url: server.url,
+        oauth: false,
+        timeout: new ConfigMCP.Timeout({ startup: 400 }),
+      }),
+      import.meta.dir,
+    ).pipe(Effect.flip)
+    const elapsed = performance.now() - started
+    console.info("MCP stalled retry receipt", { elapsed, attempts })
+    // Allow 200 ms for real SDK/fetch scheduling, but not a second 400 ms initialize timeout.
+    expect(elapsed).toBeLessThan(600)
+    expect(error).toBeInstanceOf(McpClient.ConnectError)
+    yield* Effect.promise(() => Bun.sleep(50))
+    expect(aborted).toBe(1)
+    yield* Effect.promise(() => Bun.sleep(300))
+    expect(attempts).toBe(2)
+    expect(server.state.initializations).toBe(2)
+    expect(server.state.toolLists).toBe(0)
+  }),
+)
+
+for (const firstStatus of [503, 404]) {
+  testEffect(Layer.empty).live(`MCP startup budget rejects late success after ${firstStatus}`, () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      let aborted = 0
+      let successfulResponses = 0
+      const server = yield* resourceServer({
+        respond: async (request) => {
+          if (request.method !== "POST") return
+          const body = (await request.clone().json()) as { method?: string }
+          if (body.method !== "initialize") return
+          attempts += 1
+          if (attempts === 1) {
+            // A 503 consumes the retry backoff; a 404 consumes time before the Code Mode query fallback.
+            if (firstStatus === 404) await Bun.sleep(250)
+            return new Response("try again", { status: firstStatus })
+          }
+          return new Promise<Response | undefined>((resolve) => {
+            const timer = setTimeout(() => {
+              request.signal.removeEventListener("abort", abort)
+              successfulResponses += 1
+              resolve(undefined)
+            }, 250)
+            const abort = () => {
+              clearTimeout(timer)
+              aborted += 1
+              resolve(new Response("aborted", { status: 503 }))
+            }
+            request.signal.addEventListener("abort", abort, { once: true })
+          })
+        },
+      })
+      const started = performance.now()
+      const result = yield* connect(
+        "startup-budget",
+        new ConfigMCP.Remote({
+          type: "remote",
+          url: server.url,
+          oauth: false,
+          timeout: new ConfigMCP.Timeout({ startup: 400 }),
+        }),
+        import.meta.dir,
+      ).pipe(Effect.exit)
+      console.info("MCP late success receipt", { firstStatus, elapsed: performance.now() - started, attempts })
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        const error = Cause.squash(result.cause)
+        expect(error).toBeInstanceOf(McpClient.ConnectError)
+        expect(error).toMatchObject({ message: "MCP startup timed out after 400ms" })
+      }
+      yield* Effect.promise(() => Bun.sleep(350))
+      expect(aborted).toBe(1)
+      expect(successfulResponses).toBe(0)
+      expect(attempts).toBe(2)
+      expect(server.state.initializations).toBe(2)
+      if (firstStatus === 404) {
+        expect(new URL(server.state.urls[0]).searchParams.get("codemode")).toBe("false")
+        expect(server.state.urls[1]).toBe(server.url)
+      }
+      expect(server.state.toolLists).toBe(0)
+    }),
+  )
+}
+
+testEffect(Layer.empty).live("MCP startup budget preserves caller cancellation during a retry", () =>
+  Effect.gen(function* () {
+    let attempts = 0
+    let aborted = 0
+    const retryStarted = yield* Deferred.make<void>()
+    const server = yield* resourceServer({
+      respond: async (request) => {
+        if (request.method !== "POST") return
+        const body = (await request.clone().json()) as { method?: string }
+        if (body.method !== "initialize") return
+        attempts += 1
+        if (attempts === 1) return new Response("restarting", { status: 503 })
+        return new Promise<Response>((resolve) => {
+          request.signal.addEventListener(
+            "abort",
+            () => {
+              aborted += 1
+              resolve(new Response("aborted", { status: 503 }))
+            },
+            { once: true },
+          )
+          Deferred.doneUnsafe(retryStarted, Exit.void)
+        })
+      },
+    })
+    const fiber = yield* connect(
+      "startup-budget",
+      new ConfigMCP.Remote({
+        type: "remote",
+        url: server.url,
+        oauth: false,
+        timeout: new ConfigMCP.Timeout({ startup: 1_000 }),
+      }),
+      import.meta.dir,
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.await(retryStarted)
+    yield* Fiber.interrupt(fiber)
+    const result = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(result) && Cause.hasInterrupts(result.cause)).toBe(true)
+    // Wait past the aggregate deadline as well as the next retry's backoff.
+    yield* Effect.promise(() => Bun.sleep(1_100))
+    expect(aborted).toBe(1)
+    expect(attempts).toBe(2)
+    expect(server.state.initializations).toBe(2)
+    expect(server.state.toolLists).toBe(0)
+  }),
+)
+
 for (const entry of [
   { name: "default", query: "", codemode: undefined, expected: "?codemode=false" },
   { name: "explicit local code mode", query: "", codemode: true, expected: "?codemode=false" },
@@ -1722,11 +1882,10 @@ for (const negative of [
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit))
           expect(
-            exit.cause.reasons.some(
-              (reason) =>
-                negative instanceof Permission.DeclinedError
-                  ? Cause.isDieReason(reason) && reason.defect === negative
-                  : Cause.isFailReason(reason) && reason.error instanceof Tool.Error && reason.error.error === negative,
+            exit.cause.reasons.some((reason) =>
+              negative instanceof Permission.DeclinedError
+                ? Cause.isDieReason(reason) && reason.defect === negative
+                : Cause.isFailReason(reason) && reason.error instanceof Tool.Error && reason.error.error === negative,
             ),
           ).toBe(true)
         expect(server.state.resourceReads).toEqual([])
