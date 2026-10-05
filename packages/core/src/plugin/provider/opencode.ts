@@ -461,11 +461,7 @@ export const OpencodePlugin = define<HttpClient.HttpClient | Bus.Service | Manag
 
     // Console config can change independently of local credential activity, so re-fetch
     // periodically and only rebuild the catalog and search providers when the snapshot differs.
-    yield* Effect.sleep(Duration.minutes(1)).pipe(
-      Effect.andThen(check()),
-      Effect.forever,
-      Effect.forkScoped,
-    )
+    yield* Effect.sleep(Duration.minutes(1)).pipe(Effect.andThen(check()), Effect.forever, Effect.forkScoped)
   }),
 })
 
