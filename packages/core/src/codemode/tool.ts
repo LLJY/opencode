@@ -1,16 +1,10 @@
 export * as CodeModeTool from "./tool.js"
 
-import { CodeMode, Namespace, Tool, toolError } from "@opencode/codemode"
-import type {
-  Content,
-  Context,
-  Error,
-  Info,
-  Metadata,
-  Namespace as ToolNamespace,
-  Result,
-} from "@opencode/schema/tool"
-import { Effect, Ref, Schema, Semaphore } from "effect"
+import { CodeMode, Extension, Namespace, Tool, toolError } from "@opencode/codemode"
+import { Error } from "@opencode/schema/tool"
+import type { Content, Context, Info, Metadata, Namespace as ToolNamespace, Result } from "@opencode/schema/tool"
+import { Cause, Effect, Ref, Schema, Semaphore } from "effect"
+import { Permission } from "../permission.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeWeb } from "./web.js"
@@ -82,30 +76,86 @@ export const create = (
         const callIndex = yield* Ref.make(0)
         const files = yield* Ref.make<Array<CollectedFiles>>([])
         const calls = yield* Ref.make<Array<ExecuteCall>>([])
+        // Program errors are catchable; native defects and negative decisions are not.
+        // Keep their original causes outside the interpreter and use its uncatchable
+        // interruption path for delivery, restoring provenance after its scope closes.
+        const stopped = yield* Ref.make<Cause.Cause<Error> | undefined>(undefined)
+        const native = <A, E extends Error>(run: Effect.Effect<A, E>) =>
+          Effect.suspend(() =>
+            Ref.getUnsafe(stopped)
+              ? Effect.interrupt
+              : run.pipe(
+                  Effect.catchCause((cause) => {
+                    const denied = cause.reasons.some((reason) => {
+                      if (!Cause.isFailReason(reason)) return false
+                      let decision: unknown = reason.error
+                      while (decision instanceof Error) decision = decision.error
+                      return decision instanceof Permission.BlockedError || decision instanceof Permission.DeclinedError
+                    })
+                    if (!Cause.hasDies(cause) && !denied) return Effect.failCause(cause)
+                    return Ref.update(stopped, (previous) => (previous ? Cause.combine(previous, cause) : cause)).pipe(
+                      Effect.andThen(Effect.interrupt),
+                    )
+                  }),
+                ),
+          )
         const lock = Semaphore.makeUnsafe(1)
         const record = (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) =>
-          lock.withPermit(
-            Ref.updateAndGet(calls, update).pipe(Effect.tap((toolCalls) => context.progress({ toolCalls }))),
+          native(
+            lock.withPermit(
+              Ref.updateAndGet(calls, update).pipe(Effect.tap((toolCalls) => context.progress({ toolCalls }))),
+            ),
           )
-        const result = yield* runtime(
+        const program = runtime(
           inventory,
           (name, tool, input) =>
-            Effect.gen(function* () {
-              const index = yield* Ref.getAndUpdate(callIndex, (index) => index + 1)
-              const executed = yield* executeTool(name, tool, input, context)
-              const content =
-                typeof executed.content === "string"
-                  ? [{ type: "text" as const, text: executed.content }]
-                  : (executed.content ?? [])
-              const outputFileParts = outputFiles(content)
-              if (outputFileParts.length > 0)
-                yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
-              if (executed.output !== undefined) return executed.output
-              const text = content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
-              return text === "" ? null : text
-            }),
+            native(
+              Effect.gen(function* () {
+                const index = yield* Ref.getAndUpdate(callIndex, (index) => index + 1)
+                const executed = yield* executeTool(name, tool, input, context)
+                const content =
+                  typeof executed.content === "string"
+                    ? [{ type: "text" as const, text: executed.content }]
+                    : (executed.content ?? [])
+                const outputFileParts = outputFiles(content)
+                if (outputFileParts.length > 0)
+                  yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
+                if (executed.output !== undefined) {
+                  // Copy out inside the native boundary: serialization can fail after
+                  // the leaf effect, so it must not become a catchable program error.
+                  const text = JSON.stringify(executed.output)
+                  return text === undefined ? undefined : JSON.parse(text)
+                }
+                const text = content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+                return text === "" ? null : text
+              }),
+            ),
           progressHooks(record),
+          Extension.make({
+            ...CodeModeWeb.extension,
+            // Extension globals run eagerly, before extension.before. Guard the
+            // native function itself, including calls from unawaited sibling work.
+            globals: Object.fromEntries(
+              Object.entries(CodeModeWeb.extension.globals).map(([name, call]) => [
+                name,
+                (...args: unknown[]) => {
+                  const cause = Ref.getUnsafe(stopped)
+                  if (cause) throw Cause.squash(cause)
+                  return call(...args)
+                },
+              ]),
+            ),
+          }),
         ).execute(code)
+        const result = yield* Effect.uninterruptibleMask((restore) =>
+          restore(program).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => {
+              const cause = Ref.getUnsafe(stopped)
+              return cause ? Effect.failCause(cause) : exit
+            }),
+          ),
+        )
         const toolCalls = yield* Ref.get(calls)
         const collected = (yield* Ref.get(files))
           .toSorted((left, right) => left.index - right.index)
@@ -222,6 +272,7 @@ function runtime(
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<unknown, unknown>,
   hooks?: CodeMode.Hooks,
+  extension: Extension.Extension = CodeModeWeb.extension,
 ) {
   // A path may carry namespace metadata, a callable tool, child tools, or all three.
   const root: ToolNode = { children: new Map() }
@@ -236,7 +287,7 @@ function runtime(
     })
   }
   const tools = renderTools(root)
-  return CodeMode.make<typeof tools>({ tools, extensions: [CodeModeWeb.extension], hooks })
+  return CodeMode.make<typeof tools>({ tools, extensions: [extension], hooks })
 }
 
 function getNode<T>(root: Node<T>, path: string) {

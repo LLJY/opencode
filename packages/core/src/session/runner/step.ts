@@ -156,7 +156,10 @@ export const make = Effect.gen(function* () {
         if (streamInterrupted) yield* interruptTools
         const joined = yield* restore(Fiber.awaitAll(toolRuns.map((run) => run.fiber))).pipe(Effect.exit)
         if (Exit.isFailure(joined)) yield* interruptTools
-        const tools = classifyToolExits(joined, toolRuns)
+        // An interrupted await loses its collected values, not the children's completed exits.
+        // Cleanup has joined every child; inspect them under the uninterruptible settlement mask.
+        const exits = Exit.isSuccess(joined) ? joined.value : yield* Fiber.awaitAll(toolRuns.map((run) => run.fiber))
+        const tools = classifyToolExits(exits, toolRuns, Exit.isFailure(joined) ? joined.cause : undefined)
 
         const overflow = overflowFailure ?? streamFailure
         if (
@@ -304,10 +307,10 @@ export const make = Effect.gen(function* () {
 
 /** Tool.Error settles in each fiber; only user declines remain in the typed error channel. */
 const classifyToolExits = (
-  settled: Exit.Exit<Array<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>>,
+  exits: ReadonlyArray<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>,
   runs: ReadonlyArray<{ readonly call: ToolCall }>,
+  joinedCause?: Cause.Cause<never>,
 ) => {
-  const exits = Exit.isSuccess(settled) ? settled.value : []
   const declines = exits.flatMap((exit, index) =>
     Exit.isFailure(exit)
       ? exit.cause.reasons.flatMap((reason) =>
@@ -315,14 +318,12 @@ const classifyToolExits = (
         )
       : [],
   )
-  const causes = Exit.isFailure(settled)
-    ? [settled.cause]
-    : exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
-  const failure = causes
-    .flatMap((cause) => {
-      const reasons = cause.reasons.filter(Cause.isDieReason)
-      return reasons.length > 0 ? [Cause.fromReasons<never>(reasons)] : []
-    })
-    .at(0)
+  const causes = [
+    ...(joinedCause ? [joinedCause] : []),
+    ...exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : [])),
+  ]
+  // Preserve every known defect and accompanying interruption, rather than selecting one sibling.
+  const reasons = causes.flatMap((cause) => cause.reasons.filter((reason) => !Cause.isFailReason(reason)))
+  const failure = reasons.some(Cause.isDieReason) ? Cause.fromReasons<never>(reasons) : undefined
   return { interrupted: causes.some(Cause.hasInterrupts), declines, failure }
 }

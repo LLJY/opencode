@@ -11,7 +11,7 @@ import { Tool } from "@opencode/core/tool"
 import type { Info } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { codeModeListings, executeTool, toolDefinitions } from "./lib/tool"
-import { Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
 import { z } from "zod"
 import { testEffect } from "./lib/effect"
 
@@ -1076,16 +1076,16 @@ describe("Tool", () => {
         },
         { codemode: false },
       )
-      expect(
-        yield* executeTool(service, {
-          sessionID,
-          ...identity,
-          call: { type: "tool-call", id: "invalid-output", name: "invalid_output", input: {} },
-        }),
-      ).toMatchObject({
-        status: "error",
-        error: { type: "tool.execution", message: expect.stringContaining("invalid value for its output schema") },
-      })
+      const invalidOutput = yield* executeTool(service, {
+        sessionID,
+        ...identity,
+        call: { type: "tool-call", id: "invalid-output", name: "invalid_output", input: {} },
+      }).pipe(Effect.exit)
+      expect(Exit.isFailure(invalidOutput)).toBe(true)
+      if (Exit.isFailure(invalidOutput)) {
+        expect(invalidOutput.cause.reasons.some(Cause.isDieReason)).toBe(true)
+        expect(Cause.pretty(invalidOutput.cause)).toContain("invalid value for its output schema")
+      }
     }),
   )
 
