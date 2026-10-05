@@ -1682,19 +1682,69 @@ it.live("discovers and reads MCP resources through Code Mode", () =>
       )
       expect(missing.metadata?.error).toBe(true)
       expect(missing.output.output).toContain("MCP server not found: missing")
-
-      const reads = server.state.resourceReads.length
-      decision = Effect.fail(
-        new Permission.BlockedError({ rules: [], permission: "opencode_read_mcp_resource", resources: ["*"] }),
-      )
-      const denied = yield* run(
-        'return await tools.opencode.read_mcp_resource({ server: "resources", uri: "docs://denied" })',
-      )
-      expect(denied.metadata?.error).toBe(true)
-      expect(server.state.resourceReads).toHaveLength(reads)
     }).pipe(Effect.provide(resourceMcpLayer(server.url)))
   }),
 )
+
+for (const negative of [
+  new Permission.BlockedError({ rules: [], permission: "opencode_read_mcp_resource", resources: ["*"] }),
+  new Permission.DeclinedError(),
+]) {
+  it.live(`stops Code Mode MCP resource calls after ${negative._tag}`, () =>
+    Effect.gen(function* () {
+      assertion = yield* Deferred.make<Permission.AssertInput>()
+      // Subsequent calls would be allowed, so no reads proves the execution stopped,
+      // rather than merely encountering another permission rejection.
+      decision = (negative instanceof Permission.DeclinedError ? Effect.die(negative) : Effect.fail(negative)).pipe(
+        Effect.ensuring(Effect.sync(() => (decision = Effect.void))),
+      )
+      const server = yield* resourceServer()
+      yield* Effect.gen(function* () {
+        const mcp = yield* Mcp.Service
+        yield* settled(mcp)
+        yield* registerToolPlugin(McpResourceTools.Plugin).pipe(Effect.provide(permissions))
+        const tools = yield* Tool.Service
+        const snapshot = yield* tools.snapshot()
+        const run = (code: string) =>
+          snapshot.execute({
+            sessionID: Session.ID.make("ses_resource_negative"),
+            ...toolIdentity,
+            call: { type: "tool-call", id: "call_resource_negative", name: "execute", input: { code } },
+          })
+        const exit = yield* run(`
+          try { await tools.opencode.read_mcp_resource({ server: "resources", uri: "docs://denied" }); }
+          catch (error) {
+            await tools.opencode.read_mcp_resource({ server: "resources", uri: "docs://retried" });
+          }
+          await tools.opencode.read_mcp_resource({ server: "resources", uri: "docs://later" });
+          return "unsafe success";
+        `).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit))
+          expect(
+            exit.cause.reasons.some(
+              (reason) =>
+                negative instanceof Permission.DeclinedError
+                  ? Cause.isDieReason(reason) && reason.defect === negative
+                  : Cause.isFailReason(reason) && reason.error instanceof Tool.Error && reason.error.error === negative,
+            ),
+          ).toBe(true)
+        expect(server.state.resourceReads).toEqual([])
+        expect(yield* Deferred.await(assertion!)).toMatchObject({
+          action: "opencode_read_mcp_resource",
+          resources: ["resources:docs://denied"],
+        })
+
+        // The stop belongs to this invocation, not to the reusable tool snapshot.
+        const allowed = yield* run(
+          'return await tools.opencode.read_mcp_resource({ server: "resources", uri: "docs://allowed" })',
+        )
+        expect(allowed.metadata?.error).toBeUndefined()
+        expect(server.state.resourceReads).toEqual(["docs://allowed"])
+      }).pipe(Effect.provide(resourceMcpLayer(server.url)))
+    }),
+  )
+}
 
 test("adds, disconnects, and reconnects MCP servers at runtime", async () => {
   const published: string[] = []

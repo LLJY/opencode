@@ -120,7 +120,7 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
       const http = RequestExecutor.responseHttp(response)
       return {
         // Charge active upstream waits for framed progress, not comment heartbeats or consumer pauses.
-        // Check the absolute whole-request budget on every pull, even if frames were already queued.
+        // Pulls can return many frames. Check queued frames too, without charging chunk wait for consumer pauses.
         frames: Stream.transformPull(prepared.framing.frame(RequestExecutor.responseStream(response)), (pull) =>
           Effect.succeed(
             Effect.gen(function* () {
@@ -135,12 +135,32 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
               )
             }),
           ),
+        ).pipe(
+          Stream.mapEffect((frame) => checkDeadline(started + Duration.toMillis(total), http).pipe(Effect.as(frame))),
         ),
         http,
         body: prepared.framing.body,
       }
     }),
 })
+
+/** A frame or native event can remain buffered after the network pull has completed. */
+export const checkDeadline = (deadline: number, http: HttpContext) =>
+  deadline === Infinity
+    ? Effect.void
+    : Effect.gen(function* () {
+        if ((yield* Clock.currentTimeMillis) < deadline) return
+        return yield* new AIError({
+          reason: new TransportError({
+            message: "Timed out waiting for the response to complete",
+            transport: "http",
+            operation: "read",
+            code: "Timeout",
+            url: http.url,
+            http,
+          }),
+        })
+      })
 
 const timeoutDuration = (value: HttpTimeout | undefined) =>
   value === false ? Duration.infinity : Duration.millis(value ?? DEFAULT_HTTP_TIMEOUT_MS)
