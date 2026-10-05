@@ -50,8 +50,11 @@ export const execute = (tool: Tool.Info<any, any>, input: unknown, context: Tool
         ...(result.metadata === undefined ? {} : { metadata: result.metadata }),
       }
     }
-    if (!("output" in result)) return yield* new Tool.Error({ message: "Tool did not return its declared output" })
-    const output = yield* encodeOutput(tool.output, result.output)
+    // The leaf already executed. Missing or locally invalid output cannot prove that
+    // its side effect was rejected; preserve a defect for the runner's reconciliation barrier.
+    if (!("output" in result))
+      return yield* Effect.die(new Tool.Error({ message: "Tool did not return its declared output" }))
+    const output = yield* encodeOutput(tool.output, result.output).pipe(Effect.orDie)
     return {
       output,
       content: normalizeContent(result.content, output),

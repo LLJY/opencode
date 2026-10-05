@@ -5935,6 +5935,47 @@ describe("SessionRunnerLLM", () => {
     ])
   })
 
+  for (const missing of [false, true]) {
+    scenario(`blocks continuation after post-execution ${missing ? "missing" : "invalid"} local output`, function* (s) {
+      let effects = 0
+      const registry = yield* Tool.Service
+      yield* transformTools(
+        registry,
+        {
+          validation: {
+            name: "validation",
+            description: "Side effect followed by local output validation",
+            input: Schema.Struct({}),
+            output: Schema.Struct({ ok: Schema.Boolean }),
+            execute: () =>
+              Effect.sync(() => {
+                effects++
+                return missing
+                  ? { content: "effect accepted" }
+                  : { output: { ok: "invalid" }, content: "effect accepted" }
+              }),
+          },
+        },
+        { codemode: false },
+      )
+      yield* s.admit("Execute once with output validation")
+      yield* s.llm.push(
+        TestLLM.tool("validation-once", "validation", {}),
+        TestLLM.text("Must not continue", "unsafe-validation"),
+      )
+      const first = yield* s.resume.pipe(Effect.exit)
+      expect(Exit.isFailure(first)).toBe(true)
+      expect(effects).toBe(1)
+      expect(s.requests).toHaveLength(1)
+      expect(requireAssistant(yield* s.context).content).toMatchObject([
+        { type: "tool", state: { status: "error", error: { type: "tool.outcome-unknown" } } },
+      ])
+      expect(Exit.isFailure(yield* s.resume.pipe(Effect.exit))).toBe(true)
+      expect(effects).toBe(1)
+      expect(s.requests).toHaveLength(1)
+    })
+  }
+
   for (const failed of [false, true]) {
     scenario(
       `never re-executes a settled ${failed ? "failed" : "successful"} receipt during partial continuation`,
