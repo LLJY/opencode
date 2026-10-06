@@ -53,6 +53,43 @@ describe("Model.Compatibility", () => {
       requireAssistantAfterTool: true,
     })
   })
+
+  test("keeps capability overrides that gate protocol features", () => {
+    const decode = Schema.decodeUnknownSync(Model.Compatibility)
+
+    for (const supportsEffortUpdates of [false, true]) {
+      expect(decode({ supportsEffortUpdates, supportsThinkingBlockBinding: true })).toEqual({
+        supportsEffortUpdates,
+        supportsThinkingBlockBinding: true,
+      })
+    }
+  })
+
+  test("omits undefined protocol capability overrides when encoded", () => {
+    expect(
+      Schema.encodeSync(Model.Compatibility)({
+        supportsEffortUpdates: undefined,
+        supportsThinkingBlockBinding: undefined,
+      }),
+    ).toEqual({})
+  })
+
+  test("decodes and encodes the optional protocol capability override matrix", () => {
+    const decode = Schema.decodeUnknownSync(Model.Compatibility)
+    const encode = Schema.encodeSync(Model.Compatibility)
+
+    expect(decode({})).toStrictEqual({})
+    for (const supportsEffortUpdates of [false, true, undefined]) {
+      for (const supportsThinkingBlockBinding of [false, true, undefined]) {
+        const wireCompatibility = {
+          ...(supportsEffortUpdates === undefined ? {} : { supportsEffortUpdates }),
+          ...(supportsThinkingBlockBinding === undefined ? {} : { supportsThinkingBlockBinding }),
+        }
+        expect(decode(wireCompatibility)).toStrictEqual(wireCompatibility)
+        expect(encode({ supportsEffortUpdates, supportsThinkingBlockBinding })).toStrictEqual(wireCompatibility)
+      }
+    }
+  })
 })
 
 describe("Model.Info", () => {

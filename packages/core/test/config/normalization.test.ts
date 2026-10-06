@@ -230,6 +230,33 @@ describe("ConfigNormalize", () => {
     })
   })
 
+  test("preserves native protocol capability overrides and omits undefined values", () => {
+    for (const supportsEffortUpdates of [false, true, undefined]) {
+      for (const supportsThinkingBlockBinding of [false, true, undefined]) {
+        const wireCompatibility = {
+          ...(supportsEffortUpdates === undefined ? {} : { supportsEffortUpdates }),
+          ...(supportsThinkingBlockBinding === undefined ? {} : { supportsThinkingBlockBinding }),
+        }
+        const result = normalized({
+          providers: {
+            gateway: {
+              models: { custom: { compatibility: wireCompatibility } },
+            },
+          },
+        })
+        expect(result.encoded.providers).toStrictEqual({
+          gateway: {
+            models: {
+              custom: {
+                compatibility: wireCompatibility,
+              },
+            },
+          },
+        })
+      }
+    }
+  })
+
   test("uses a valid retired provider alias when the canonical legacy entry is malformed", () => {
     const result = normalized({
       provider: {
@@ -553,6 +580,22 @@ describe("ConfigNormalize", () => {
       "blockBinding",
     ])
     expect(result.encoded.providers).not.toHaveProperty(["gateway", "models", "untouched", "compatibility"])
+  })
+
+  test("does not mutate caller input when migrating legacy thinking block-binding opt-outs", () => {
+    const input = {
+      provider: {
+        gateway: {
+          models: {
+            anthropic: { options: { thinking: { type: "adaptive", blockBinding: false } } },
+            bedrock: { options: { reasoningConfig: { blockBinding: false } } },
+          },
+        },
+      },
+    }
+    const before = structuredClone(input)
+    normalized(input)
+    expect(input).toStrictEqual(before)
   })
 
   test("invalid legacy provider overlays skip only that provider", () => {

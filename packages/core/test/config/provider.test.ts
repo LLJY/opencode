@@ -637,6 +637,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
                         reasoningField: "vendor_reasoning",
                         maxTokensField: "max_completion_tokens",
                         requireFinishReason: false,
+                        supportsEffortUpdates: false,
+                        supportsThinkingBlockBinding: false,
                       },
                       capabilities: { tools: true, input: ["text"], output: ["text"] },
                       disabled: true,
@@ -669,6 +671,9 @@ describe("ConfigProviderPlugin.Plugin", () => {
                   models: {
                     default: {
                       name: "Default",
+                    },
+                    explicit: {
+                      compatibility: { supportsEffortUpdates: true, supportsThinkingBlockBinding: true },
                     },
                     chat: {
                       modelID: "api-chat",
@@ -735,6 +740,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
           reasoningField: "vendor_reasoning",
           maxTokensField: "max_completion_tokens",
           requireFinishReason: false,
+          supportsEffortUpdates: false,
+          supportsThinkingBlockBinding: false,
         })
         expect(model.capabilities).toEqual({ tools: true, input: ["text"], output: ["text"] })
         expect(model.enabled).toBe(false)
@@ -759,6 +766,13 @@ describe("ConfigProviderPlugin.Plugin", () => {
         expect(model.variants?.[0]?.headers).toEqual({ first: "first", shared: "last", last: "last" })
         expect(model.variants?.[0]?.settings).toEqual({ effort: "high" })
         expect(model.variants?.[1]?.headers).toEqual({ slow: "slow" })
+
+        const explicitModel = required(yield* models.get(providerID, Model.ID.make("explicit")))
+        const defaultModel = required(yield* models.get(providerID, Model.ID.make("default")))
+        expect(explicitModel.compatibility?.supportsEffortUpdates).toBe(true)
+        expect(explicitModel.compatibility?.supportsThinkingBlockBinding).toBe(true)
+        expect(defaultModel.compatibility?.supportsEffortUpdates).toBeUndefined()
+        expect(defaultModel.compatibility?.supportsThinkingBlockBinding).toBeUndefined()
       }),
     ),
   )
