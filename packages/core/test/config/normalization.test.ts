@@ -570,7 +570,14 @@ describe("ConfigNormalize", () => {
       },
     })
     expect(result.encoded.providers).not.toHaveProperty(["gateway", "models", "bedrock", "settings", "reasoningConfig"])
-    expect(result.encoded.providers).not.toHaveProperty(["gateway", "models", "both", "settings", "thinking", "blockBinding"])
+    expect(result.encoded.providers).not.toHaveProperty([
+      "gateway",
+      "models",
+      "both",
+      "settings",
+      "thinking",
+      "blockBinding",
+    ])
     expect(result.encoded.providers).not.toHaveProperty([
       "gateway",
       "models",

@@ -25,7 +25,13 @@ test("formats the model identity part", () => {
 })
 
 const identity = (name: string, id: string, version: string) =>
-  ["# Your Model", `- Name: ${name}`, "- Provider ID: test", `- Model ID: ${id}`, `- OpenCode version: ${version}`].join("\n")
+  [
+    "# Your Model",
+    `- Name: ${name}`,
+    "- Provider ID: test",
+    `- Model ID: ${id}`,
+    `- OpenCode version: ${version}`,
+  ].join("\n")
 
 const context = (id: string): SessionHooks["context"] => ({
   sessionID: Session.ID.make("ses_model_identity"),

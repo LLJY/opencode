@@ -25,10 +25,7 @@ export const Plugin = define({
         Effect.orElseSucceed(() => false),
       )
 
-    const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (
-      target: string,
-      type: "file" | "directory",
-    ) {
+    const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (target: string, type: "file" | "directory") {
       const updates = yield* watcher.subscribe({ path: target, type })
       yield* FiberMap.run(
         watches,
